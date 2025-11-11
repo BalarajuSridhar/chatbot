@@ -13,6 +13,9 @@ npm-debug.log*
 pnpm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+pnpm-lock.yaml # (if you prefer to ignore; usually you COMMIT lockfiles)
+.pnpm-store/
+
 
 # Environment files
 .env
@@ -155,3 +158,6 @@ Dockerfile.local
 *.old
 *.orig
 *.rej
+backend/chroma/
+**/chroma/
+*.bin
