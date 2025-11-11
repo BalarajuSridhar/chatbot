@@ -21,7 +21,7 @@ export const metadata: Metadata = {
   description:
     "Upload PDFs and ask AI-powered questions. Powered by OpenAI GPT and Whisper.",
   keywords: [
-    "AI chatbot",
+    "AI chatbots",
     "PDF Q&A",
     "OpenAI",
     "Whisper",
