@@ -1,0 +1,157 @@
+# ======================================================
+# 🔹 Root Level (Common)
+# ======================================================
+# Node & Python dependencies
+node_modules/
+__pycache__/
+
+# Logs & Debug
+logs/
+*.log
+*.log.*
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Environment files
+.env
+.env.local
+.env.development
+.env.development.local
+.env.test
+.env.test.local
+.env.production
+.env.production.local
+
+# OS-specific
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Icon?
+desktop.ini
+
+# IDEs & Editors
+.vscode/
+.idea/
+*.sublime-workspace
+*.sublime-project
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.bak
+*.backup
+*.swp
+*.swo
+
+# Coverage & Reports
+coverage/
+.nyc_output/
+*.lcov
+*.coverage
+htmlcov/
+pytest_cache/
+.tox/
+.nox/
+.pytest_cache/
+
+# ======================================================
+# 🔹 Frontend (React / Next.js / Vite / pnpm)
+# ======================================================
+# Build outputs
+/frontend/dist/
+frontend/.next/
+frontend/out/
+frontend/build/
+
+# Cache & temp
+frontend/.cache/
+frontend/.parcel-cache/
+frontend/.vite/
+frontend/.eslintcache
+frontend/.stylelintcache
+frontend/.babel-cache/
+
+# Dependency files
+frontend/node_modules/
+frontend/pnpm-lock.yaml
+frontend/package-lock.json
+frontend/yarn.lock
+
+# Local development configs
+frontend/.env.local
+frontend/.env.development.local
+frontend/.env.test.local
+frontend/.env.production.local
+
+# ======================================================
+# 🔹 Backend (FastAPI / Python)
+# ======================================================
+/backend/__pycache__/
+/backend/*.py[cod]
+/backend/*.pyo
+/backend/*.pyd
+/backend/*.so
+/backend/.mypy_cache/
+/backend/.pytest_cache/
+/backend/.coverage
+/backend/venv/
+/backend/.venv/
+/backend/env/
+/backend/.env
+/backend/env.bak
+/backend/instance/
+/backend/db.sqlite3
+/backend/*.db
+/backend/migrations/
+/backend/uploads/
+/backend/staticfiles/
+/backend/.python-version
+/backend/.ruff_cache
+/backend/.ruff.toml
+
+# ======================================================
+# 🔹 Docker & Deployment
+# ======================================================
+docker-compose.override.yml
+.docker/
+Dockerfile.dev
+Dockerfile.local
+*.pid
+*.seed
+*.pid.lock
+*.tar
+*.gz
+*.zip
+*.tgz
+
+# ======================================================
+# 🔹 Database (PostgreSQL / SQLite)
+# ======================================================
+*.sqlite3
+*.db
+*.sql
+*.sql.gz
+*.dump
+
+# ======================================================
+# 🔹 Jupyter / Colab (if used for data analysis)
+# ======================================================
+*.ipynb
+.ipynb_checkpoints/
+
+# ======================================================
+# 🔹 Others
+# ======================================================
+*.pem
+*.key
+*.crt
+*.pfx
+*.cert
+*.csr
+*.der
+*.old
+*.orig
+*.rej
