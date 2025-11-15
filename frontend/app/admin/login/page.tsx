@@ -37,7 +37,7 @@ export default function LoginPage(){
   return (
     <div className="min-h-screen flex items-center justify-center p-4 bg-white">
       <div className="w-full max-w-md bg-white border border-black rounded-lg p-8 shadow-[0_4px_12px_rgba(0,0,0,0.1)]">
-        <h2 className="text-2xl font-bold mb-6 text-black text-center">Admin Loginn</h2>
+        <h2 className="text-2xl font-bold mb-6 text-black text-center">Admin Login</h2>
         <form onSubmit={submit} className="space-y-5">
           <div>
             <input 
