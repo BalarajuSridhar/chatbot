@@ -1,161 +1,147 @@
+// app/page.tsx
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
 
-// Backend base URL (set NEXT_PUBLIC_API_BASE in .env.local to override)
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
 
-// --- Types matching your backend (answer-only) ---
-type IngestResponse = {
-  documents_added: number;
-  chunks_indexed: number;
-};
-
-type AskResponse = {
-  answer: string;
-};
-
-type STTResponse = {
-  text: string;
-};
-
+type AskResponse = { answer: string };
+type STTResponse = { text: string };
 type MsgRole = "user" | "assistant" | "system";
+type Message = { id: string; role: MsgRole; text: string };
+type LangCode = "en" | "te" | "ta" | "hi";
 
-type Message = {
-  id: string;
-  role: MsgRole;
-  text: string;
-};
-
-// ---- Minimal Web Speech API types (to avoid using `any`) ----
-// These are small structural types so we compile without extra libs.
-
-type SpeechRecognitionConstructor = new () => SpeechRecognition;
-
-type SpeechRecognition = {
+// --- Minimal Web Speech API types so TS doesn't require lib.dom ---
+type SRConstructor = new () => SR;
+type SR = {
   lang: string;
   interimResults: boolean;
   continuous: boolean;
-  start: () => void;
-  stop: () => void;
-  onresult: ((e: SpeechRecognitionEvent) => void) | null;
+  start(): void;
+  stop(): void;
+  onresult: ((e: SREvent) => void) | null;
   onerror: ((e: Event) => void) | null;
   onend: (() => void) | null;
 };
-
-type SpeechRecognitionEvent = {
+type SREvent = {
   resultIndex: number;
-  results: SpeechRecognitionResultList;
+  results: ArrayLike<SRResult>;
 };
-
-type SpeechRecognitionResultList = ArrayLike<SpeechRecognitionResult>;
-
-type SpeechRecognitionResult = {
+type SRResult = {
   isFinal: boolean;
   0: { transcript: string };
 };
 
 export default function Page() {
-  const [files, setFiles] = useState<File[]>([]);
-  const [isDragging, setIsDragging] = useState(false);
-  const [ingesting, setIngesting] = useState(false);
   const [asking, setAsking] = useState(false);
   const [question, setQuestion] = useState("");
   const [messages, setMessages] = useState<Message[]>([
-    {
-      id: uid(),
-      role: "system",
-      text: "Upload one or more PDFs, click ‘Upload & Index’, then ask a question. Use the mic to dictate your question.",
-    },
+    { id: uid(), role: "system", text: "Upload PDFs in Admin, then ask questions about them." },
   ]);
-
-  // STT state
-  const [recording, setRecording] = useState(false);
+  const [language, setLanguage] = useState<LangCode>("en");
+  const [datasets, setDatasets] = useState<string[]>([]);
+  const [dataset, setDataset] = useState<string>("");
   const [useBrowserSTT, setUseBrowserSTT] = useState(true);
+  const [recording, setRecording] = useState(false);
+
+  const audioRef = useRef<HTMLAudioElement | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<BlobPart[]>([]);
-  const browserRecRef = useRef<SpeechRecognition | null>(null);
-
+  const browserRecRef = useRef<SR | null>(null);
   const bottomRef = useRef<HTMLDivElement | null>(null);
+  const router = useRouter();
+
+  useEffect(() => bottomRef.current?.scrollIntoView({ behavior: "smooth" }), [messages, asking]);
+
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, asking]);
+    let mounted = true;
+    fetch(`${API_BASE}/datasets`)
+      .then((r) => r.json())
+      .then((j) => {
+        if (!mounted) return;
+        setDatasets(j.datasets || []);
+      })
+      .catch(() => setDatasets([]));
+    return () => {
+      mounted = false;
+    };
+  }, []);
 
-  // ---------- File handlers ----------
-  const onDrop = (e: React.DragEvent<HTMLDivElement>) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setIsDragging(false);
-    const dropped = Array.from(e.dataTransfer.files || []).filter(isPDF);
-    if (dropped.length) setFiles((prev) => dedupe([...prev, ...dropped]));
-  };
-
-  const onPick = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const picked = Array.from(e.target.files || []).filter(isPDF);
-    if (picked.length) setFiles((prev) => dedupe([...prev, ...picked]));
-  };
-
-  const removeFile = (name: string) => setFiles((prev) => prev.filter((f) => f.name !== name));
-  const clearFiles = () => setFiles([]);
-
-  // ---------- API calls ----------
-  const handleIngest = async () => {
-    if (files.length === 0) return toast("Please choose at least one PDF.");
-    const fd = new FormData();
-    files.forEach((f) => fd.append("files", f));
-    try {
-      setIngesting(true);
-      const res = await fetch(`${API_BASE}/ingest`, { method: "POST", body: fd });
-      if (!res.ok) throw new Error(await safeText(res));
-      const data = (await res.json()) as IngestResponse;
-      toast(`Indexed ${data.documents_added} file(s), ${data.chunks_indexed} chunks.`);
-    } catch (err: unknown) {
-      toast(errorMessage(err) || "Failed to ingest PDFs");
-    } finally {
-      setIngesting(false);
-    }
-  };
-
-  const handleAsk = async () => {
+  // ---------- ASK ----------
+  async function handleAsk() {
     const q = question.trim();
-    if (!q) return toast("Type or dictate a question first.");
-
-    setMessages((prev) => [...prev, { id: uid(), role: "user", text: q }]);
+    if (!q) return toast("Type a question first.");
+    setMessages((p) => [...p, { id: uid(), role: "user", text: q }]);
     setQuestion("");
-
+    setAsking(true);
     try {
-      setAsking(true);
       const res = await fetch(`${API_BASE}/ask`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question: q, top_k: 4 }),
+        body: JSON.stringify({ question: q, top_k: 4, language, dataset: dataset || undefined }),
       });
       if (!res.ok) throw new Error(await safeText(res));
       const data = (await res.json()) as AskResponse;
-      setMessages((prev) => [...prev, { id: uid(), role: "assistant", text: data.answer || "(no answer)" }]);
-    } catch (err: unknown) {
-      setMessages((prev) => [
-        ...prev,
-        { id: uid(), role: "assistant", text: `Error: ${errorMessage(err) || "Failed to ask"}` },
+      setMessages((p) => [...p, { id: uid(), role: "assistant", text: data.answer || "(no answer)" }]);
+    } catch (e) {
+      setMessages((p) => [
+        ...p,
+        { id: uid(), role: "assistant", text: `Error: ${errorMessage(e) || "Ask failed"}` },
       ]);
     } finally {
       setAsking(false);
     }
-  };
+  }
 
-  // ---------- STT helpers ----------
-  function getSpeechRecognitionCtor(): SpeechRecognitionConstructor | null {
-    const w = window as unknown as {
-      SpeechRecognition?: SpeechRecognitionConstructor;
-      webkitSpeechRecognition?: SpeechRecognitionConstructor;
-    };
+  // ---------- TTS ----------
+  async function playTTS(text: string) {
+    try {
+      if (!text) return;
+      // Stop any playing
+      try {
+        audioRef.current?.pause();
+        audioRef.current = null;
+      } catch {}
+      const res = await fetch(`${API_BASE}/tts`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text, language }),
+      });
+      if (!res.ok) throw new Error(await safeText(res));
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = new Audio(url);
+      audioRef.current = a;
+      a.onended = () => URL.revokeObjectURL(url);
+      await a.play();
+    } catch (e) {
+      toast("TTS failed");
+      console.error(e);
+    }
+  }
+
+  function stopTTS() {
+    try {
+      audioRef.current?.pause();
+      audioRef.current = null;
+    } catch {}
+  }
+
+  // ---------- STT (Browser + Server fallback) ----------
+  function sttLocale(code: LangCode) {
+    return code === "en" ? "en-US" : code === "hi" ? "hi-IN" : code === "te" ? "te-IN" : code === "ta" ? "ta-IN" : "en-US";
+  }
+
+  function getSpeechRecognitionCtor(): SRConstructor | null {
+    const w = window as any;
     return w.SpeechRecognition || w.webkitSpeechRecognition || null;
   }
 
   function startBrowserSTT() {
     const Ctor = getSpeechRecognitionCtor();
     if (!Ctor) {
-      toast("Browser STT not supported. Falling back to server.");
+      toast("Browser STT not supported. Falling back to server STT.");
       setUseBrowserSTT(false);
       startServerRecording();
       return;
@@ -163,38 +149,39 @@ export default function Page() {
     try {
       const rec = new Ctor();
       browserRecRef.current = rec;
-      rec.lang = "en-US"; // change if needed
+      rec.lang = sttLocale(language);
       rec.interimResults = true;
       rec.continuous = true;
 
       let finalText = "";
-      rec.onresult = (e: SpeechRecognitionEvent) => {
+      rec.onresult = (e: SREvent) => {
         let interim = "";
         for (let i = e.resultIndex; i < e.results.length; i++) {
-          const seg = e.results[i][0].transcript;
-          if (e.results[i].isFinal) finalText += seg + " ";
+          const seg = (e.results[i][0] as { transcript: string }).transcript;
+          if ((e.results[i] as SRResult).isFinal) finalText += seg + " ";
           else interim += seg;
         }
         setQuestion(finalText || interim);
       };
       rec.onerror = () => {
-        toast("Browser STT error. Falling back to server.");
-        rec.stop();
+        toast("Browser STT error. Falling back to server STT.");
+        try {
+          rec.stop();
+        } catch {}
         startServerRecording();
       };
       rec.onend = () => {
         setRecording(false);
-        const trimmed = finalText.trim();
-        if (trimmed) {
-          setQuestion((prev) => (prev ? `${prev} ${trimmed}` : trimmed));
-          toast("Transcribed (browser)");
-        }
+        const trimmed = (rec as any).__final || "".trim(); // not needed; finalText captured above
+        // final text already applied in onresult when isFinal fired
+        if ((trimmed || "").trim()) toast("Transcribed (browser)");
       };
 
       rec.start();
       setRecording(true);
-    } catch {
-      toast("Browser STT init failed. Falling back to server.");
+    } catch (err) {
+      console.warn("Browser STT init failed", err);
+      toast("Browser STT init failed. Falling back to server STT.");
       startServerRecording();
     }
   }
@@ -206,9 +193,9 @@ export default function Page() {
     }
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const supportsWebm = typeof MediaRecorder !== "undefined" && MediaRecorder.isTypeSupported("audio/webm");
+      const supportsWebm = typeof MediaRecorder !== "undefined" && MediaRecorder.isTypeSupported?.("audio/webm");
       const mr = new MediaRecorder(stream, supportsWebm ? { mimeType: "audio/webm" } : undefined);
-
+      (mr as any).stream = stream;
       chunksRef.current = [];
       mr.ondataavailable = (e: BlobEvent) => {
         if (e.data && e.data.size > 0) chunksRef.current.push(e.data);
@@ -216,37 +203,55 @@ export default function Page() {
       mr.onstop = async () => {
         const type = supportsWebm ? "audio/webm" : "audio/wav";
         const blob = new Blob(chunksRef.current, { type });
-        await sendToSTT(blob);
-        stream.getTracks().forEach((t) => t.stop());
+        try {
+          await sendToSTT(blob);
+        } finally {
+          try {
+            stream.getTracks().forEach((t) => t.stop());
+          } catch {}
+        }
       };
-
       mediaRecorderRef.current = mr;
       mr.start();
       setRecording(true);
-    } catch {
-      toast("Microphone permission denied.");
+    } catch (err) {
+      console.warn("Server recording failed", err);
+      toast("Microphone permission denied or unavailable.");
     }
   }
 
   function stopBrowserSTT() {
     const rec = browserRecRef.current;
-    if (rec) rec.stop();
+    if (rec) {
+      try {
+        rec.onresult = null;
+        rec.onend = null;
+        rec.onerror = null;
+        rec.stop();
+      } catch {}
+      browserRecRef.current = null;
+    }
     setRecording(false);
   }
 
   function stopServerRecording() {
     const mr = mediaRecorderRef.current;
-    if (mr && mr.state !== "inactive") mr.stop();
+    if (mr && mr.state !== "inactive") {
+      try {
+        mr.stop();
+      } catch {}
+    }
     setRecording(false);
   }
 
   async function sendToSTT(blob: Blob) {
     const fd = new FormData();
     fd.append("audio", new File([blob], "query.webm", { type: blob.type || "audio/webm" }));
+    fd.append("lang", language);
     try {
       const res = await fetch(`${API_BASE}/stt`, { method: "POST", body: fd });
       if (res.status === 429) {
-        toast("Server STT quota exceeded. Enable Browser STT.");
+        toast("Server STT quota exceeded. Use Browser STT.");
         setUseBrowserSTT(true);
         return;
       }
@@ -259,148 +264,155 @@ export default function Page() {
       } else {
         toast("No speech detected.");
       }
-    } catch (e: unknown) {
+    } catch (e) {
       toast(errorMessage(e) || "Transcription failed");
     }
   }
 
-  const disabled = ingesting || asking;
+  // Combined toggle for mic
+  async function toggleRecording() {
+    if (recording) {
+      if (useBrowserSTT) stopBrowserSTT();
+      else stopServerRecording();
+    } else {
+      if (useBrowserSTT) startBrowserSTT();
+      else startServerRecording();
+    }
+  }
 
+  // Navigate to admin login
+  function goToAdmin() {
+    router.push("/admin/login");
+  }
+
+  // ---------- UI ----------
   return (
-    <div className="min-h-screen bg-gradient-to-b from-slate-50 to-white text-slate-900">
+    <div className="min-h-screen bg-gradient-to-b from-slate-50 to-white">
       {/* Header */}
       <header className="sticky top-0 z-10 backdrop-blur bg-white/70 border-b">
         <div className="mx-auto max-w-5xl px-4 py-3 flex items-center justify-between">
           <div className="flex items-center gap-2">
-            <Logo />
-            <h1 className="text-xl sm:text-2xl font-bold tracking-tight">PDF Q&A Chatbot</h1>
+            <div className="w-8 h-8 rounded-xl bg-slate-900 text-white grid place-items-center font-bold">Q</div>
+            <h1 className="text-xl sm:text-2xl font-bold">PDF Q&A Chatbot</h1>
+            <div className="ml-4 text-sm text-slate-600 hidden sm:block">Ask questions about your uploaded PDFs</div>
           </div>
-          <EnvPill />
+
+          <div className="flex items-center gap-3">
+            <div className="text-xs px-2 py-1 rounded-full border bg-white/70 text-slate-600">
+              API:{" "}
+              {useMemo(() => {
+                try {
+                  return new URL(API_BASE).host;
+                } catch {
+                  return API_BASE;
+                }
+              }, [])}
+            </div>
+            
+            {/* Admin Login Button */}
+            <button
+              onClick={goToAdmin}
+              className="text-xs px-3 py-1.5 rounded-full border border-slate-300 bg-white/70 text-slate-700 hover:bg-slate-50 transition-colors"
+            >
+              Admin Login
+            </button>
+          </div>
         </div>
       </header>
 
       {/* Main */}
-      <main className="mx-auto max-w-5xl px-4 py-6 grid gap-6 lg:grid-cols-2">
-        {/* Left column: Upload */}
-        <section className="lg:sticky lg:top-20 h-fit">
-          <Card>
-            <h2 className="text-lg font-semibold">1) Upload & Index PDFs</h2>
-            <p className="text-sm text-slate-600">Drop files below or click to select. Only PDFs are accepted.</p>
+      <main className="mx-auto max-w-5xl px-4 py-6 grid gap-6 lg:grid-cols-1">
+        <section>
+          <div className="rounded-2xl border bg-white/90 shadow-sm p-5">
+            <h2 className="text-lg font-semibold mb-4">Ask questions about your documents</h2>
 
-            <div
-              onDragOver={(e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                setIsDragging(true);
-              }}
-              onDragLeave={(e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                setIsDragging(false);
-              }}
-              onDrop={onDrop}
-              className={`mt-4 border-2 border-dashed rounded-2xl p-6 text-center transition ${isDragging ? "bg-slate-100" : "bg-slate-50"}`}
-            >
-              <input id="file-input" type="file" accept="application/pdf" multiple onChange={onPick} className="hidden" />
-              <label htmlFor="file-input" className="cursor-pointer inline-flex flex-col items-center justify-center gap-2">
-                <CloudIcon />
-                <span className="font-medium">Click to choose PDFs</span>
-                <span className="text-xs text-slate-500">or drag & drop here</span>
+            <div className="mb-3 flex items-center gap-3 text-sm text-slate-600">
+              <label className="flex items-center gap-2">
+                Answer language:
+                <select value={language} onChange={(e) => setLanguage(e.target.value as LangCode)} className="border rounded px-2 py-1 ml-1">
+                  <option value="en">English</option>
+                  <option value="te">Telugu</option>
+                  <option value="ta">Tamil</option>
+                  <option value="hi">Hindi</option>
+                </select>
+              </label>
+
+              <label className="flex items-center gap-2">
+                Dataset:
+                <select value={dataset} onChange={(e) => setDataset(e.target.value)} className="border rounded px-2 py-1 ml-1">
+                  <option value="">(All)</option>
+                  {datasets.map((d) => (
+                    <option key={d} value={d}>
+                      {d}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <label className="flex items-center gap-2">
+                <input type="checkbox" checked={useBrowserSTT} onChange={(e) => setUseBrowserSTT(e.target.checked)} />
+                <span>Browser STT</span>
               </label>
             </div>
 
-            {files.length > 0 && (
-              <div className="mt-4 max-h-48 overflow-auto rounded-xl border bg-white">
-                <ul className="divide-y">
-                  {files.map((f) => (
-                    <li key={f.name} className="flex items-center justify-between px-3 py-2 text-sm">
-                      <span className="truncate max-w-[70%]" title={f.name}>{f.name}</span>
-                      <button onClick={() => removeFile(f.name)} className="text-slate-500 hover:text-red-600 text-xs">Remove</button>
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            )}
-
-            <div className="mt-4 flex items-center gap-2">
-              <button
-                onClick={handleIngest}
-                disabled={files.length === 0 || disabled}
-                className="px-4 py-2 rounded-xl bg-slate-900 text-white hover:bg-slate-800 disabled:opacity-40 disabled:cursor-not-allowed"
-              >
-                {ingesting ? "Indexing…" : "Upload & Index"}
-              </button>
-              {files.length > 0 && (
-                <button onClick={clearFiles} disabled={disabled} className="px-3 py-2 rounded-xl border hover:bg-slate-50">Clear</button>
-              )}
-            </div>
-          </Card>
-        </section>
-
-        {/* Right column: Chat */}
-        <section>
-          <Card>
-            <h2 className="text-lg font-semibold">2) Ask a question</h2>
-
-            <div className="mt-4 space-y-3 max-h-[60vh] overflow-auto pr-1">
+            <div className="space-y-3 max-h-[54vh] overflow-auto pr-1 mb-4">
               {messages.map((m) => (
-                <ChatBubble key={m.id} role={m.role} text={m.text} />
+                <div key={m.id} className={`flex ${m.role === "user" ? "justify-end" : "justify-start"} mb-2`}>
+                  <div
+                    className={`max-w-[90%] sm:max-w-[80%] px-4 py-3 text-sm leading-relaxed whitespace-pre-wrap ${
+                      m.role === "user" ? "bg-slate-900 text-white rounded-t-2xl rounded-bl-2xl" : "bg-slate-50 rounded-t-2xl rounded-br-2xl"
+                    }`}
+                  >
+                    <div>{m.text}</div>
+                    {m.role === "assistant" && (
+                      <div className="mt-2 flex gap-2">
+                        <button onClick={() => playTTS(m.text)} className="text-xs px-2 py-1 rounded border hover:bg-slate-100">
+                          🔊 Speak
+                        </button>
+                        <button onClick={() => stopTTS()} className="text-xs px-2 py-1 rounded border hover:bg-slate-100">
+                          ■ Stop
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                </div>
               ))}
-              {asking && <TypingBubble />}
+              {asking && (
+                <div className="text-sm text-slate-500">
+                  Thinking…
+                </div>
+              )}
               <div ref={bottomRef} />
             </div>
 
-            <div className="mt-4 flex flex-col gap-2">
-              <div className="flex items-center gap-2">
-                <input
-                  value={question}
-                  onChange={(e) => setQuestion(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" && !e.shiftKey) {
-                      e.preventDefault();
-                      handleAsk();
-                    }
-                  }}
-                  placeholder="Ask about your PDFs…"
-                  className="flex-1 border rounded-xl px-3 py-2 focus:outline-none focus:ring-2 focus:ring-slate-300"
-                />
-                <button
-                  onClick={handleAsk}
-                  disabled={asking || !question.trim()}
-                  className="px-4 py-2 rounded-xl bg-slate-900 text-white hover:bg-slate-800 disabled:opacity-40 disabled:cursor-not-allowed"
-                >
-                  {asking ? "Thinking…" : "Ask"}
-                </button>
-              </div>
+            <div className="flex items-center gap-2">
+              <input
+                value={question}
+                onChange={(e) => setQuestion(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !e.shiftKey) {
+                    e.preventDefault();
+                    handleAsk();
+                  }
+                }}
+                placeholder="Ask about your documents…"
+                className="flex-1 border rounded-xl px-3 py-2 focus:outline-none focus:ring-2 focus:ring-slate-300"
+              />
 
-              <div className="flex items-center gap-3">
-                <label className="flex items-center gap-2 text-xs text-slate-600 select-none">
-                  <input
-                    type="checkbox"
-                    checked={useBrowserSTT}
-                    onChange={(e) => setUseBrowserSTT(e.target.checked)}
-                  />
-                  Browser STT
-                </label>
+              <button
+                onClick={toggleRecording}
+                title={recording ? "Stop recording" : "Start recording"}
+                className={`px-3 py-2 rounded-xl border hover:bg-slate-50 ${recording ? "border-red-500 text-red-600" : ""}`}
+                disabled={asking}
+              >
+                {recording ? "Stop" : "Mic"}
+              </button>
 
-                <button
-                  type="button"
-                  onClick={() => {
-                    if (recording) {
-                      useBrowserSTT ? stopBrowserSTT() : stopServerRecording();
-                    } else {
-                      useBrowserSTT ? startBrowserSTT() : startServerRecording();
-                    }
-                  }}
-                  title={recording ? "Stop recording" : "Start recording"}
-                  className={`px-3 py-2 rounded-xl border hover:bg-slate-50 ${recording ? "border-red-500 text-red-600" : ""}`}
-                  disabled={asking}
-                >
-                  {recording ? "Stop" : "Mic"}
-                </button>
-              </div>
+              <button onClick={handleAsk} disabled={asking || !question.trim()} className="px-4 py-2 rounded-xl bg-slate-900 text-white">
+                {asking ? "Thinking…" : "Ask"}
+              </button>
             </div>
-          </Card>
+          </div>
         </section>
       </main>
 
@@ -409,65 +421,9 @@ export default function Page() {
   );
 }
 
-// ---------- UI PRIMITIVES ----------
-function Card({ children }: { children: React.ReactNode }) {
-  return <div className="rounded-2xl border bg-white/90 shadow-sm p-5">{children}</div>;
-}
-
-function ChatBubble({ role, text }: { role: MsgRole; text: string }) {
-  const isUser = role === "user";
-  const isSystem = role === "system";
-  const align = isUser ? "items-end" : "items-start";
-  const bg = isSystem ? "bg-slate-100" : isUser ? "bg-slate-900 text-white" : "bg-slate-50";
-  const radius = isUser ? "rounded-t-2xl rounded-bl-2xl" : "rounded-t-2xl rounded-br-2xl";
-  return (
-    <div className={`flex ${align}`}>
-      <div className={`max-w-[90%] sm:max-w-[80%] ${bg} ${radius} px-4 py-3 text-sm leading-relaxed whitespace-pre-wrap`}>{text}</div>
-    </div>
-  );
-}
-
-function TypingBubble() {
-  return (
-    <div className="flex items-start">
-      <div className="bg-slate-50 rounded-t-2xl rounded-br-2xl px-4 py-3 text-sm">
-        <span className="inline-flex gap-1">
-          <Dot /> <Dot /> <Dot />
-        </span>
-      </div>
-    </div>
-  );
-}
-
-function Dot() {
-  return <span className="w-2 h-2 inline-block rounded-full bg-slate-400 animate-pulse" />;
-}
-
-function Logo() {
-  return (
-    <div className="w-8 h-8 rounded-xl bg-slate-900 text-white grid place-items-center font-bold" aria-label="Logo">Q</div>
-  );
-}
-
-function EnvPill() {
-  const base = useMemo(() => {
-    try {
-      return new URL(API_BASE).host;
-    } catch {
-      return API_BASE;
-    }
-  }, []);
-  return (
-    <div className="text-xs px-2 py-1 rounded-full border bg-white/70 text-slate-600" title={API_BASE}>
-      API: {base}
-    </div>
-  );
-}
-
-// ---------- TOASTS ----------
+// ---------- Toaster ----------
 function Toaster() {
   const [items, setItems] = useState<{ id: string; text: string }[]>([]);
-
   useEffect(() => {
     const onToast = (e: Event) => {
       const ce = e as CustomEvent<string>;
@@ -479,7 +435,6 @@ function Toaster() {
     window.addEventListener("app:toast", onToast as EventListener);
     return () => window.removeEventListener("app:toast", onToast as EventListener);
   }, []);
-
   return (
     <div className="fixed bottom-4 right-4 flex flex-col gap-2 z-50">
       {items.map((i) => (
@@ -497,27 +452,10 @@ function toast(text: string) {
   }
 }
 
-// ---------- HELPERS ----------
+// ---------- Helpers ----------
 function uid() {
-  const g = typeof crypto !== "undefined" && typeof crypto.randomUUID === "function" ? crypto.randomUUID() : undefined;
+  const g = typeof crypto !== "undefined" && typeof (crypto as any).randomUUID === "function" ? (crypto as any).randomUUID() : undefined;
   return g || `id_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-}
-
-function dedupe(list: File[]) {
-  const seen = new Set<string>();
-  const out: File[] = [];
-  for (const f of list) {
-    const key = `${f.name}-${f.size}`;
-    if (!seen.has(key)) {
-      seen.add(key);
-      out.push(f);
-    }
-  }
-  return out;
-}
-
-function isPDF(f: File) {
-  return f.type === "application/pdf" || f.name.toLowerCase().endsWith(".pdf");
 }
 
 async function safeText(res: Response) {
@@ -535,12 +473,4 @@ function errorMessage(e: unknown): string | undefined {
     if (typeof m === "string") return m;
   }
   return undefined;
-}
-
-function CloudIcon() {
-  return (
-    <svg width="36" height="36" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-      <path d="M7 18H17C19.2091 18 21 16.2091 21 14C21 11.9848 19.5223 10.3184 17.5894 10.0458C16.9942 7.74078 14.9289 6 12.5 6C10.2387 6 8.30734 7.4246 7.65085 9.50138C5.61892 9.68047 4 11.3838 4 13.4375C4 15.6228 5.79086 17.5 8 17.5H7Z" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
-    </svg>
-  );
 }
