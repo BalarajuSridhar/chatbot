@@ -6,13 +6,13 @@ import logging
 from typing import List, Optional, Any
 from datetime import datetime, timedelta
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Depends, Body, Request
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Depends, Body, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
-# SQLModel for dataset metadata (optional small DB)
+# SQLModel for dataset metadata + logs
 from sqlmodel import SQLModel, create_engine, Session, Field, select
 
 # vector / embedding / PDF / OpenAI
@@ -79,7 +79,7 @@ app.add_middleware(
 )
 
 # ---------------------------------------------------------------------
-# DB (SQLModel) for dataset metadata (lightweight)
+# DB (SQLModel) for dataset metadata and logs
 # ---------------------------------------------------------------------
 DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{os.path.join(BASE_DIR, 'backend.db')}")
 engine = create_engine(DATABASE_URL, echo=False)
@@ -90,6 +90,17 @@ class DatasetMeta(SQLModel, table=True):
     created_by: Optional[str] = None
     version: int = 1
     note: Optional[str] = None
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+class LoggedQuestion(SQLModel, table=True):
+    """
+    Stores each user question + assistant answer for admin viewing.
+    """
+    id: Optional[int] = Field(default=None, primary_key=True)
+    question: str
+    answer: Optional[str] = None
+    dataset: Optional[str] = None
+    language: Optional[str] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
 SQLModel.metadata.create_all(engine)
@@ -246,6 +257,38 @@ def admin_token(form_data: OAuth2PasswordRequestForm = Depends()):
     token = create_access_token(sub=ADMIN_USERNAME, username=ADMIN_USERNAME)
     return {"access_token": token, "token_type": "bearer"}
 
+@app.get("/admin/logs")
+def get_logged_questions(
+    limit: int = Query(200, gt=0, le=1000), 
+    since: Optional[str] = Query(None),
+    admin = Depends(get_current_admin)
+):
+    """
+    Return recent logged questions. Query params:
+    - limit: max number of rows (default 200, max 1000)
+    - since: ISO datetime string to filter from (inclusive)
+    """
+    with Session(engine) as session:
+        q = select(LoggedQuestion).order_by(LoggedQuestion.created_at.desc())
+        if since:
+            try:
+                since_dt = datetime.fromisoformat(since.replace('Z', '+00:00'))
+                q = q.where(LoggedQuestion.created_at >= since_dt)
+            except Exception as e:
+                logger.warning(f"Invalid 'since' param {since}: {e}")
+                # Continue without the since filter if it's invalid
+        rows = session.exec(q.limit(limit)).all()
+        out = []
+        for r in rows:
+            out.append({
+                "id": r.id,
+                "question": r.question,
+                "answer": r.answer,
+                "dataset": r.dataset,
+                "language": r.language,
+                "created_at": r.created_at.isoformat(),
+            })
+        return {"logs": out}
 
 @app.get("/datasets")
 def list_datasets():
@@ -322,9 +365,28 @@ async def ask(req: AskRequest):
     q = (req.question or "").strip()
     if not q:
         raise HTTPException(status_code=400, detail="Question cannot be empty")
+    
+    # Log the question immediately (we'll update with answer later)
+    with Session(engine) as session:
+        log_entry = LoggedQuestion(
+            question=q,
+            dataset=req.dataset,
+            language=req.language
+        )
+        session.add(log_entry)
+        session.commit()
+        log_id = log_entry.id
+    
     qvecs = embed_texts([q])
     if not qvecs:
+        # Update log with error
+        with Session(engine) as session:
+            log_entry = session.get(LoggedQuestion, log_id)
+            if log_entry:
+                log_entry.answer = "Error: Failed to embed query"
+                session.commit()
         raise HTTPException(status_code=500, detail="Failed to embed query")
+    
     qvec = qvecs[0]
     try:
         if req.dataset:
@@ -338,6 +400,12 @@ async def ask(req: AskRequest):
             results = collection.query(query_embeddings=[qvec], n_results=max(1, req.top_k))
     except Exception as e:
         logger.exception("Vector DB query failed")
+        # Update log with error
+        with Session(engine) as session:
+            log_entry = session.get(LoggedQuestion, log_id)
+            if log_entry:
+                log_entry.answer = f"Error: Vector DB query failed - {str(e)}"
+                session.commit()
         raise HTTPException(status_code=500, detail=str(e))
 
     contexts: List[str] = []
@@ -354,7 +422,14 @@ async def ask(req: AskRequest):
             contexts = []
 
     if not contexts:
-        return AskResponse(answer="I couldn't find relevant content in the indexed PDFs.")
+        answer_text = "I couldn't find relevant content in the indexed PDFs."
+        # Update log with no context found
+        with Session(engine) as session:
+            log_entry = session.get(LoggedQuestion, log_id)
+            if log_entry:
+                log_entry.answer = answer_text
+                session.commit()
+        return AskResponse(answer=answer_text)
 
     prompt = build_prompt(q, contexts, req.language)
     try:
@@ -373,7 +448,14 @@ async def ask(req: AskRequest):
             answer = getattr(completion, "text", "") or str(completion)
     except Exception as e:
         logger.exception("LLM completion failed")
-        raise HTTPException(status_code=500, detail=str(e))
+        answer = f"Error: Failed to generate answer - {str(e)}"
+
+    # Update the log entry with the final answer
+    with Session(engine) as session:
+        log_entry = session.get(LoggedQuestion, log_id)
+        if log_entry:
+            log_entry.answer = answer
+            session.commit()
 
     return AskResponse(answer=answer)
 

@@ -11,6 +11,16 @@ type MsgRole = "user" | "assistant" | "system";
 type Message = { id: string; role: MsgRole; text: string };
 type LangCode = "en" | "te" | "ta" | "hi";
 
+// Logs types
+type LogRow = {
+  id: number;
+  question: string;
+  answer?: string;
+  dataset?: string | null;
+  language?: string | null;
+  created_at: string;
+};
+
 // Minimal Web Speech types so TS doesn't require lib.dom
 type SRConstructor = new () => SR;
 
@@ -76,6 +86,12 @@ export default function AdminDashboard() {
   const [useBrowserSTT, setUseBrowserSTT] = useState(true);
   const [recording, setRecording] = useState(false);
   const [uploadMessage, setUploadMessage] = useState("");
+
+  // Logs state
+  const [tab, setTab] = useState<"upload" | "chat" | "logs">("upload");
+  const [logs, setLogs] = useState<LogRow[]>([]);
+  const [selectedLog, setSelectedLog] = useState<LogRow | null>(null);
+  const [loadingLogs, setLoadingLogs] = useState(false);
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<BlobPart[]>([]);
@@ -227,6 +243,45 @@ export default function AdminDashboard() {
     }
   };
 
+  // ---------- Logs ----------
+  async function fetchLogs() {
+    setLoadingLogs(true);
+    try {
+      const token = localStorage.getItem("admin_token");
+      const res = await fetch(`${API_BASE}/admin/logs?limit=200`, {
+        headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+      });
+      if (res.status === 401) {
+        // token invalid
+        localStorage.removeItem("admin_token");
+        router.push("/admin/login");
+        return;
+      }
+      if (!res.ok) {
+        console.error("Failed to fetch logs:", await res.text());
+        setLogs([]);
+        return;
+      }
+      const j = await res.json();
+      setLogs(j.logs || []);
+      if ((j.logs || []).length > 0) {
+        setSelectedLog((j.logs || [])[0]);
+      } else {
+        setSelectedLog(null);
+      }
+    } catch (e) {
+      console.error("fetchLogs error:", e);
+      setLogs([]);
+    } finally {
+      setLoadingLogs(false);
+    }
+  }
+
+  function pickLog(l: LogRow) {
+    setSelectedLog(l);
+    setTab("logs");
+  }
+
   // ---------- STT helpers ----------
   function sttLocale(code: LangCode) {
     return code === "en" ? "en-US" : code === "hi" ? "hi-IN" : code === "te" ? "te-IN" : code === "ta" ? "ta-IN" : "en-US";
@@ -375,10 +430,36 @@ export default function AdminDashboard() {
     <div className="min-h-screen bg-gradient-to-b from-slate-50 to-white">
       {/* Header */}
       <header className="sticky top-0 z-10 backdrop-blur bg-white/70 border-b">
-        <div className="mx-auto max-w-5xl px-4 py-3 flex items-center justify-between">
+        <div className="mx-auto max-w-6xl px-4 py-3 flex items-center justify-between">
           <div className="flex items-center gap-4">
             <div className="w-8 h-8 rounded-xl bg-slate-900 text-white grid place-items-center font-bold">Q</div>
             <h1 className="text-xl sm:text-2xl font-bold">Admin Dashboard</h1>
+            <nav className="ml-6 flex items-center gap-2">
+              <button 
+                onClick={() => setTab("upload")} 
+                className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${
+                  tab === "upload" ? "bg-slate-900 text-white" : "text-slate-600 hover:bg-slate-100"
+                }`}
+              >
+                Upload
+              </button>
+              <button 
+                onClick={() => setTab("chat")} 
+                className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${
+                  tab === "chat" ? "bg-slate-900 text-white" : "text-slate-600 hover:bg-slate-100"
+                }`}
+              >
+                Chat
+              </button>
+              <button 
+                onClick={() => { setTab("logs"); fetchLogs(); }} 
+                className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${
+                  tab === "logs" ? "bg-slate-900 text-white" : "text-slate-600 hover:bg-slate-100"
+                }`}
+              >
+                User Logs
+              </button>
+            </nav>
           </div>
           <div className="flex items-center gap-4">
             <button onClick={() => router.push("/")} className="px-3 py-1 rounded border hover:bg-slate-100 text-sm">Main Chat</button>
@@ -397,74 +478,92 @@ export default function AdminDashboard() {
         </div>
       </header>
 
-      {/* Main Content with Upload + Chat */}
-      <main className="mx-auto max-w-5xl px-4 py-6 grid gap-6 lg:grid-cols-2">
-        {/* Upload Section */}
-        <section className="lg:sticky lg:top-20 h-fit">
-          <div className="rounded-2xl border bg-white/90 shadow-sm p-5">
-            <h2 className="text-lg font-semibold">Upload & Index PDFs</h2>
-            <p className="text-sm text-slate-600 mb-4">Drop files below or click to select. Only PDFs are accepted.</p>
+      {/* Main Content */}
+      <main className="mx-auto max-w-6xl px-4 py-6">
+        {tab === "upload" && (
+          <section className="grid gap-6 lg:grid-cols-2">
+            {/* Upload Section */}
+            <div className="rounded-2xl border bg-white/90 shadow-sm p-5">
+              <h2 className="text-lg font-semibold">Upload & Index PDFs</h2>
+              <p className="text-sm text-slate-600 mb-4">Drop files below or click to select. Only PDFs are accepted.</p>
 
-            <div className="mb-4">
-              <label className="block text-sm font-medium text-slate-700 mb-2">Dataset Name</label>
-              <input
-                value={dataset}
-                onChange={(e) => setDataset(e.target.value)}
-                placeholder="Enter dataset name..."
-                className="w-full border rounded-xl px-3 py-2 focus:outline-none focus:ring-2 focus:ring-slate-300"
-              />
-            </div>
-
-            <div
-              onDragOver={(e) => { e.preventDefault(); e.stopPropagation(); setIsDragging(true); }}
-              onDragLeave={(e) => { e.preventDefault(); e.stopPropagation(); setIsDragging(false); }}
-              onDrop={onDrop}
-              className={`border-2 border-dashed rounded-2xl p-6 text-center transition ${isDragging ? "bg-slate-100" : "bg-slate-50"}`}>
-              <input id="file-input" type="file" accept="application/pdf" multiple onChange={onPick} className="hidden" />
-              <label htmlFor="file-input" className="cursor-pointer inline-flex flex-col items-center justify-center gap-2">
-                <CloudIcon />
-                <span className="font-medium">Click to choose PDFs</span>
-                <span className="text-xs text-slate-500">or drag & drop here</span>
-              </label>
-            </div>
-
-            {files.length > 0 && (
-              <div className="mt-4 max-h-48 overflow-auto rounded-xl border bg-white">
-                <ul className="divide-y">
-                  {files.map((f) => (
-                    <li key={f.name} className="flex items-center justify-between px-3 py-2 text-sm">
-                      <span className="truncate max-w-[70%]" title={f.name}>{f.name}</span>
-                      <button onClick={() => removeFile(f.name)} className="text-slate-500 hover:text-red-600 text-xs">Remove</button>
-                    </li>
-                  ))}
-                </ul>
+              <div className="mb-4">
+                <label className="block text-sm font-medium text-slate-700 mb-2">Dataset Name</label>
+                <input
+                  value={dataset}
+                  onChange={(e) => setDataset(e.target.value)}
+                  placeholder="Enter dataset name..."
+                  className="w-full border rounded-xl px-3 py-2 focus:outline-none focus:ring-2 focus:ring-slate-300"
+                />
               </div>
-            )}
 
-            <div className="mt-4 flex items-center gap-2">
-              <button
-                onClick={handleIngest}
-                disabled={files.length === 0 || !dataset.trim() || disabled}
-                className="px-4 py-2 rounded-xl bg-slate-900 text-white hover:bg-slate-800 disabled:opacity-40 disabled:cursor-not-allowed"
-              >
-                {ingesting ? "Uploading…" : "Upload & Index"}
-              </button>
+              <div
+                onDragOver={(e) => { e.preventDefault(); e.stopPropagation(); setIsDragging(true); }}
+                onDragLeave={(e) => { e.preventDefault(); e.stopPropagation(); setIsDragging(false); }}
+                onDrop={onDrop}
+                className={`border-2 border-dashed rounded-2xl p-6 text-center transition ${isDragging ? "bg-slate-100" : "bg-slate-50"}`}>
+                <input id="file-input" type="file" accept="application/pdf" multiple onChange={onPick} className="hidden" />
+                <label htmlFor="file-input" className="cursor-pointer inline-flex flex-col items-center justify-center gap-2">
+                  <CloudIcon />
+                  <span className="font-medium">Click to choose PDFs</span>
+                  <span className="text-xs text-slate-500">or drag & drop here</span>
+                </label>
+              </div>
+
               {files.length > 0 && (
-                <button onClick={clearFiles} disabled={disabled} className="px-3 py-2 rounded-xl border hover:bg-slate-50">Clear</button>
+                <div className="mt-4 max-h-48 overflow-auto rounded-xl border bg-white">
+                  <ul className="divide-y">
+                    {files.map((f) => (
+                      <li key={f.name} className="flex items-center justify-between px-3 py-2 text-sm">
+                        <span className="truncate max-w-[70%]" title={f.name}>{f.name}</span>
+                        <button onClick={() => removeFile(f.name)} className="text-slate-500 hover:text-red-600 text-xs">Remove</button>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              <div className="mt-4 flex items-center gap-2">
+                <button
+                  onClick={handleIngest}
+                  disabled={files.length === 0 || !dataset.trim() || disabled}
+                  className="px-4 py-2 rounded-xl bg-slate-900 text-white hover:bg-slate-800 disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  {ingesting ? "Uploading…" : "Upload & Index"}
+                </button>
+                {files.length > 0 && (
+                  <button onClick={clearFiles} disabled={disabled} className="px-3 py-2 rounded-xl border hover:bg-slate-50">Clear</button>
+                )}
+              </div>
+
+              {uploadMessage && (
+                <div className="mt-4 p-3 bg-slate-50 rounded-xl text-sm">{uploadMessage}</div>
               )}
             </div>
 
-            {uploadMessage && (
-              <div className="mt-4 p-3 bg-slate-50 rounded-xl text-sm">{uploadMessage}</div>
-            )}
-          </div>
-        </section>
+            {/* Datasets List */}
+            <div className="rounded-2xl border bg-white/90 shadow-sm p-5">
+              <h2 className="text-lg font-semibold mb-4">Available Datasets</h2>
+              {datasets.length === 0 ? (
+                <p className="text-sm text-slate-500">No datasets yet. Upload PDFs to create datasets.</p>
+              ) : (
+                <ul className="space-y-2">
+                  {datasets.map((ds) => (
+                    <li key={ds} className="flex items-center justify-between p-3 bg-slate-50 rounded-lg">
+                      <span className="font-medium text-sm">{ds}</span>
+                      <span className="text-xs text-slate-500">Active</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          </section>
+        )}
 
-        {/* Chat Section */}
-        <section>
-          <div className="rounded-2xl border bg-white/90 shadow-sm p-5">
-            <h2 className="text-lg font-semibold">Ask Questions</h2>
-            <div className="mt-4 space-y-3 max-h-[60vh] overflow-auto pr-1">
+        {tab === "chat" && (
+          <section className="rounded-2xl border bg-white/90 shadow-sm p-5">
+            <h2 className="text-lg font-semibold mb-4">Ask Questions</h2>
+            <div className="space-y-3 max-h-[60vh] overflow-auto pr-1 mb-4">
               {messages.map((m) => (
                 <ChatBubble key={m.id} role={m.role} text={m.text} />
               ))}
@@ -472,7 +571,7 @@ export default function AdminDashboard() {
               <div ref={bottomRef} />
             </div>
 
-            <div className="mt-4 flex flex-col gap-2">
+            <div className="flex flex-col gap-2">
               <div className="flex items-center gap-4 text-xs text-slate-600">
                 <label className="flex items-center gap-2 select-none">
                   <span>Answer language:</span>
@@ -524,8 +623,71 @@ export default function AdminDashboard() {
                 </button>
               </div>
             </div>
-          </div>
-        </section>
+          </section>
+        )}
+
+        {tab === "logs" && (
+          <section className="grid grid-cols-3 gap-6">
+            <div className="col-span-1 rounded-2xl border bg-white/90 shadow-sm p-4 max-h-[70vh] overflow-auto">
+              <div className="flex items-center justify-between mb-3">
+                <h3 className="font-semibold">Recent User Logs</h3>
+                <button onClick={fetchLogs} className="text-xs px-2 py-1 rounded border hover:bg-slate-50">Refresh</button>
+              </div>
+
+              {loadingLogs ? (
+                <div className="text-sm text-slate-500">Loading…</div>
+              ) : logs.length === 0 ? (
+                <div className="text-sm text-slate-500">No logs yet.</div>
+              ) : (
+                <ul className="divide-y">
+                  {logs.map((l) => (
+                    <li key={l.id} className="px-2 py-3 hover:bg-slate-50 cursor-pointer transition-colors" onClick={() => pickLog(l)}>
+                      <div className="text-xs text-slate-500 mb-1">{new Date(l.created_at).toLocaleString()}</div>
+                      <div className="text-sm font-medium truncate mb-1">{l.question}</div>
+                      <div className="text-xs text-slate-400 truncate">
+                        {l.dataset ?? "(All datasets)"} • {l.language ?? "en"}
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+
+            <div className="col-span-2 rounded-2xl border bg-white/90 shadow-sm p-4 max-h-[70vh] overflow-auto">
+              <div className="flex items-center justify-between mb-4">
+                <h3 className="font-semibold">Log Detail</h3>
+                <div className="text-xs text-slate-500">
+                  {selectedLog ? new Date(selectedLog.created_at).toLocaleString() : ""}
+                </div>
+              </div>
+
+              {!selectedLog ? (
+                <div className="text-sm text-slate-500 text-center py-8">Select a log to view details</div>
+              ) : (
+                <div className="space-y-4">
+                  <div>
+                    <div className="text-xs text-slate-500 mb-2 font-medium">Question</div>
+                    <div className="p-3 rounded-lg bg-slate-50 whitespace-pre-wrap border">{selectedLog.question}</div>
+                  </div>
+                  <div>
+                    <div className="text-xs text-slate-500 mb-2 font-medium">Answer</div>
+                    <div className="p-3 rounded-lg bg-white border whitespace-pre-wrap">
+                      {selectedLog.answer ?? "(No answer recorded)"}
+                    </div>
+                  </div>
+                  <div className="flex gap-4 text-xs text-slate-500">
+                    <div>
+                      <span className="font-medium">Dataset:</span> {selectedLog.dataset ?? "(All)"}
+                    </div>
+                    <div>
+                      <span className="font-medium">Language:</span> {selectedLog.language ?? "en"}
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+          </section>
+        )}
       </main>
 
       <Toaster />
