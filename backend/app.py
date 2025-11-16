@@ -290,6 +290,158 @@ def get_logged_questions(
             })
         return {"logs": out}
 
+@app.get("/admin/files")
+async def list_uploaded_files(
+    dataset: Optional[str] = Query(None, description="Filter by dataset"),
+    admin = Depends(get_current_admin)
+):
+    """
+    List all uploaded PDF files with their chunk counts.
+    """
+    try:
+        # Get all documents
+        try:
+            if dataset:
+                results = collection.get(where={"dataset": dataset})
+            else:
+                results = collection.get()
+        except TypeError:
+            if dataset:
+                results = collection.get(filter={"dataset": dataset})
+            else:
+                results = collection.get()
+        
+        if not results or not results.get("metadatas"):
+            return {"files": []}
+        
+        # Count files and chunks
+        file_stats = {}
+        metadatas = results["metadatas"]
+        
+        for metadata in metadatas:
+            if isinstance(metadata, dict) and "filename" in metadata:
+                filename = metadata["filename"]
+                file_dataset = metadata.get("dataset", "default")
+                
+                if filename not in file_stats:
+                    file_stats[filename] = {
+                        "filename": filename,
+                        "dataset": file_dataset,
+                        "chunk_count": 0,
+                        "has_ocr": metadata.get("ocr", False),
+                        "admin_username": metadata.get("admin_username")
+                    }
+                file_stats[filename]["chunk_count"] += 1
+        
+        files_list = list(file_stats.values())
+        files_list.sort(key=lambda x: x["filename"])
+        
+        return {"files": files_list}
+        
+    except Exception as e:
+        logger.exception("Failed to list files")
+        raise HTTPException(status_code=500, detail=f"Failed to list files: {str(e)}")
+
+@app.delete("/admin/delete/file")
+async def delete_file_by_filename(
+    filename: str = Query(..., description="Name of the PDF file to delete"),
+    dataset: Optional[str] = Query(None, description="Specific dataset to search in"),
+    admin = Depends(get_current_admin)
+):
+    """
+    Delete all chunks from a specific PDF file.
+    """
+    try:
+        # Build filter for ChromaDB
+        where_filter = {"filename": filename}
+        if dataset:
+            where_filter["dataset"] = dataset
+        
+        # Get the documents first to count them
+        try:
+            results = collection.get(where=where_filter)
+        except TypeError:
+            results = collection.get(filter=where_filter)
+        
+        if not results or not results.get("ids"):
+            raise HTTPException(status_code=404, detail=f"No documents found for filename: {filename}")
+        
+        document_count = len(results["ids"])
+        
+        # Delete from ChromaDB
+        try:
+            collection.delete(where=where_filter)
+        except TypeError:
+            collection.delete(filter=where_filter)
+        
+        logger.info(f"Deleted {document_count} chunks from file: {filename}")
+        
+        return {
+            "deleted": True,
+            "filename": filename,
+            "chunks_removed": document_count,
+            "dataset": dataset
+        }
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"Failed to delete file {filename}")
+        raise HTTPException(status_code=500, detail=f"Deletion failed: {str(e)}")
+
+@app.delete("/admin/delete/dataset")
+async def delete_entire_dataset(
+    dataset: str = Query(..., description="Name of the dataset to delete entirely"),
+    admin = Depends(get_current_admin)
+):
+    """
+    Delete all documents from a specific dataset.
+    """
+    try:
+        # Get the documents first to count them
+        try:
+            results = collection.get(where={"dataset": dataset})
+        except TypeError:
+            results = collection.get(filter={"dataset": dataset})
+        
+        if not results or not results.get("ids"):
+            raise HTTPException(status_code=404, detail=f"No documents found for dataset: {dataset}")
+        
+        document_count = len(results["ids"])
+        filenames = set()
+        if results.get("metadatas"):
+            for metadata in results["metadatas"]:
+                if isinstance(metadata, dict) and "filename" in metadata:
+                    filenames.add(metadata["filename"])
+        
+        # Delete from ChromaDB
+        try:
+            collection.delete(where={"dataset": dataset})
+        except TypeError:
+            collection.delete(filter={"dataset": dataset})
+        
+        # Also remove from DatasetMeta table
+        with Session(engine) as session:
+            datasets = session.exec(select(DatasetMeta).where(DatasetMeta.name == dataset)).all()
+            for ds in datasets:
+                session.delete(ds)
+            session.commit()
+        
+        logger.info(f"Deleted dataset '{dataset}' with {document_count} chunks from {len(filenames)} files")
+        
+        return {
+            "deleted": True,
+            "dataset": dataset,
+            "chunks_removed": document_count,
+            "files_affected": list(filenames)
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"Failed to delete dataset {dataset}")
+        raise HTTPException(status_code=500, detail=f"Dataset deletion failed: {str(e)}")
+
 @app.get("/datasets")
 def list_datasets():
     try:
@@ -494,28 +646,36 @@ async def stt(audio: UploadFile = File(...), lang: Optional[str] = Form(None)):
         logger.exception("STT failed")
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @app.post("/tts")
 async def tts(request: Request):
     """
-    Accept JSON { text, language, voice } OR form data.
+    Accept JSON { text, language, voice, speed } OR form data.
     Returns audio/mpeg stream (gTTS fallback if OpenAI TTS not available).
     """
     content_type = request.headers.get("content-type", "")
     text = None
     lang = "en"
     voice = None
+    speed = 1.0  # Default speed (1.0 = normal)
 
     if "application/json" in content_type:
         body = await request.json()
         text = body.get("text", "")
         lang = body.get("language", body.get("lang", "en"))
         voice = body.get("voice")
+        speed = body.get("speed", 1.0)  # Get speed from request, default to 1.0
     else:
         form = await request.form()
         text = form.get("text") or ""
         lang = form.get("lang") or form.get("language") or "en"
         voice = form.get("voice")
+        try:
+            speed = float(form.get("speed", 1.0))
+        except (TypeError, ValueError):
+            speed = 1.0
+
+    # Validate speed (OpenAI allows 0.25 to 4.0)
+    speed = max(0.25, min(4.0, speed))
 
     txt = (text or "").strip()
     if not txt:
@@ -524,16 +684,24 @@ async def tts(request: Request):
     # Try OpenAI TTS (if your OpenAI client supports it)
     try:
         if hasattr(openai_client, "audio") and hasattr(openai_client.audio, "speech"):
-            # NOTE: depending on your openai client version the signature will differ;
-            # adapt below if needed.
-            out = openai_client.audio.speech.create(model="gpt-4o-mini-tts", voice=voice or "alloy", input=txt, language=lang)
+            # Use OpenAI TTS with speed control
+            out = openai_client.audio.speech.create(
+                model="tts-1",  # or "tts-1-hd" for higher quality
+                voice=voice or "alloy",
+                input=txt,
+                speed=speed  # Control speed here (0.25 to 4.0)
+            )
             audio_bytes = getattr(out, "audio", None) or getattr(out, "data", None) or out
             if isinstance(audio_bytes, (bytes, bytearray)):
                 return StreamingResponse(io.BytesIO(audio_bytes), media_type="audio/mpeg")
-    except Exception:
-        logger.info("OpenAI TTS path not usable; falling back to gTTS", exc_info=True)
+    except RateLimitError as e:
+        logger.warning(f"OpenAI TTS quota exceeded, falling back to gTTS: {e}")
+        # Continue to gTTS fallback
+    except Exception as e:
+        logger.warning(f"OpenAI TTS failed, falling back to gTTS: {e}")
+        # Continue to gTTS fallback
 
-    # Fallback to gTTS
+    # Fallback to gTTS (no native speed control, we'll handle it differently)
     if gTTS is None:
         raise HTTPException(status_code=500, detail="No TTS backend available (install gTTS or enable OpenAI TTS)")
     try:
@@ -541,11 +709,13 @@ async def tts(request: Request):
         bio = io.BytesIO()
         tts.write_to_fp(bio)
         bio.seek(0)
+        
+        # For gTTS, we can't control speed natively, but we can return it as is
+        # and let the frontend handle playback speed
         return StreamingResponse(bio, media_type="audio/mpeg")
     except Exception as e:
         logger.exception("gTTS failed")
-        raise HTTPException(status_code=500, detail=str(e))
-
+        raise HTTPException(status_code=500, detail=f"TTS failed: {str(e)}")
 
 @app.post("/admin/upload")
 async def admin_upload(dataset: str = Form(...), files: List[UploadFile] = File(...), admin = Depends(get_current_admin)):
@@ -591,3 +761,8 @@ async def admin_upload(dataset: str = Form(...), files: List[UploadFile] = File(
 @app.get("/health")
 def health():
     return {"status": "ok", "provider": "openai"}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
