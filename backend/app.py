@@ -203,7 +203,16 @@ def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 150) -> List[st
             break
     return chunks
 
-LANG_NAME = {"en": "English", "te": "Telugu", "ta": "Tamil", "hi": "Hindi"}
+LANG_NAME = {
+    "en": "English", 
+    "te": "Telugu", 
+    "ta": "Tamil", 
+    "hi": "Hindi",
+    "mr": "Marathi",
+    "kn": "Kannada", 
+    "ml": "Malayalam",
+    "bn": "Bengali"
+}
 
 def build_prompt(question: str, contexts: List[str], lang_code: Optional[str]) -> str:
     language_name = LANG_NAME.get((lang_code or "en").lower(), "English")
@@ -635,7 +644,9 @@ async def stt(audio: UploadFile = File(...), lang: Optional[str] = Form(None)):
     buf.name = f"recording{ext}"
     try:
         kwargs = {"model": "whisper-1", "file": buf}
-        if lang and lang.lower() in {"en", "te", "ta", "hi"}:
+        # Add support for new Indian languages in STT
+        supported_langs = {"en", "te", "ta", "hi", "mr", "kn", "ml", "bn"}
+        if lang and lang.lower() in supported_langs:
             kwargs["language"] = lang.lower()
         resp = openai_client.audio.transcriptions.create(**kwargs)
         text = (getattr(resp, "text", None) or "").strip()
@@ -663,7 +674,7 @@ async def tts(request: Request):
         text = body.get("text", "")
         lang = body.get("language", body.get("lang", "en"))
         voice = body.get("voice")
-        speed = body.get("speed", 1.0)  # Get speed from request, default to 1.0
+        speed = body.get("speed", 1.0)
     else:
         form = await request.form()
         text = form.get("text") or ""
@@ -701,17 +712,24 @@ async def tts(request: Request):
         logger.warning(f"OpenAI TTS failed, falling back to gTTS: {e}")
         # Continue to gTTS fallback
 
-    # Fallback to gTTS (no native speed control, we'll handle it differently)
+    # Fallback to gTTS - add support for new Indian languages
     if gTTS is None:
         raise HTTPException(status_code=500, detail="No TTS backend available (install gTTS or enable OpenAI TTS)")
     try:
-        tts = gTTS(txt, lang=lang if lang in {"en", "hi", "ta", "te"} else "en")
+        # gTTS language codes for Indian languages
+        gtts_lang_map = {
+            "en": "en", "hi": "hi", "ta": "ta", "te": "te",
+            "mr": "mr",  # Marathi
+            "kn": "kn",  # Kannada  
+            "ml": "ml",  # Malayalam
+            "bn": "bn"   # Bengali
+        }
+        tts_lang = gtts_lang_map.get(lang, "en")
+        tts = gTTS(txt, lang=tts_lang)
         bio = io.BytesIO()
         tts.write_to_fp(bio)
         bio.seek(0)
         
-        # For gTTS, we can't control speed natively, but we can return it as is
-        # and let the frontend handle playback speed
         return StreamingResponse(bio, media_type="audio/mpeg")
     except Exception as e:
         logger.exception("gTTS failed")

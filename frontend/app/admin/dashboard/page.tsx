@@ -9,7 +9,7 @@ type AskResponse = { answer: string };
 type STTResponse = { text: string };
 type MsgRole = "user" | "assistant" | "system";
 type Message = { id: string; role: MsgRole; text: string; feedback?: 'good' | 'bad' };
-type LangCode = "en" | "te" | "ta" | "hi";
+type LangCode = "en" | "te" | "ta" | "hi" | "mr" | "kn" | "ml" | "bn";
 
 // Logs types
 type LogRow = {
@@ -76,6 +76,21 @@ function getAuthHeaders(): HeadersInit {
   return token ? { Authorization: `Bearer ${token}` } : {};
 }
 
+// Helper function to get language name
+function getLanguageName(code: LangCode): string {
+  const names: Record<LangCode, string> = {
+    "en": "English",
+    "te": "Telugu", 
+    "ta": "Tamil",
+    "hi": "Hindi",
+    "mr": "Marathi",
+    "kn": "Kannada",
+    "ml": "Malayalam",
+    "bn": "Bengali"
+  };
+  return names[code] || code;
+}
+
 export default function AdminDashboard() {
   const [files, setFiles] = useState<File[]>([]);
   const [uploadedFiles, setUploadedFiles] = useState<FileInfo[]>([]);
@@ -97,6 +112,7 @@ export default function AdminDashboard() {
   const [useBrowserSTT, setUseBrowserSTT] = useState(true);
   const [recording, setRecording] = useState(false);
   const [uploadMessage, setUploadMessage] = useState("");
+  const [ttsSpeed, setTtsSpeed] = useState<number>(1.0); // TTS speed control
 
   // Logs state
   const [tab, setTab] = useState<"upload" | "chat" | "logs" | "files">("upload");
@@ -257,7 +273,11 @@ export default function AdminDashboard() {
       const res = await fetch(`${API_BASE}/tts`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text, language }),
+        body: JSON.stringify({ 
+          text, 
+          language,
+          speed: ttsSpeed 
+        }),
       });
       if (!res.ok) throw new Error(await safeText(res));
       const blob = await res.blob();
@@ -436,8 +456,27 @@ export default function AdminDashboard() {
   }
 
   // ---------- STT helpers ----------
-  function sttLocale(code: LangCode) {
-    return code === "en" ? "en-US" : code === "hi" ? "hi-IN" : code === "te" ? "te-IN" : code === "ta" ? "ta-IN" : "en-US";
+  function sttLocale(code: LangCode): string {
+    // Browser Speech Recognition has limited language support
+    const supportedMap: Record<LangCode, string> = {
+      "en": "en-US",
+      "hi": "hi-IN",    // Hindi - supported in Chrome
+      "te": "en-US",    // Telugu - not widely supported
+      "ta": "en-US",    // Tamil - not widely supported  
+      "mr": "en-US",    // Marathi - not widely supported
+      "kn": "en-US",    // Kannada - not widely supported
+      "ml": "en-US",    // Malayalam - not widely supported
+      "bn": "en-US"     // Bengali - not widely supported
+    };
+    
+    const locale = supportedMap[code];
+    
+    // Show warning for unsupported languages
+    if (locale === "en-US" && code !== "en") {
+      console.warn(`Browser STT doesn't support ${code}, falling back to English`);
+    }
+    
+    return locale;
   }
 
   function getSpeechRecognitionCtor(): SRConstructor | null {
@@ -453,6 +492,16 @@ export default function AdminDashboard() {
       startServerRecording();
       return;
     }
+
+    // Check if the language is supported by browser STT
+    const isSupported = ["en", "hi"].includes(language);
+    if (!isSupported) {
+      toast(`${getLanguageName(language)} not supported in browser STT. Using server STT.`);
+      setUseBrowserSTT(false);
+      startServerRecording();
+      return;
+    }
+
     try {
       const rec = new Ctor();
       browserRecRef.current = rec;
@@ -884,6 +933,10 @@ export default function AdminDashboard() {
                       <option value="te">🇮🇳 Telugu</option>
                       <option value="ta">🇮🇳 Tamil</option>
                       <option value="hi">🇮🇳 Hindi</option>
+                      <option value="mr">🇮🇳 Marathi</option>
+                      <option value="kn">🇮🇳 Kannada</option>
+                      <option value="ml">🇮🇳 Malayalam</option>
+                      <option value="bn">🇮🇳 Bengali</option>
                     </select>
                   </label>
 
@@ -909,6 +962,24 @@ export default function AdminDashboard() {
                       className="rounded text-blue-600 focus:ring-blue-500 w-4 h-4"
                     />
                     <span>Browser Speech Recognition</span>
+                    <span className="text-xs text-gray-500">(Only EN, HI supported)</span>
+                  </label>
+
+                  {/* TTS Speed Control */}
+                  <label className="flex items-center gap-2 font-medium text-gray-700">
+                    <span>TTS Speed:</span>
+                    <select 
+                      value={ttsSpeed} 
+                      onChange={(e) => setTtsSpeed(parseFloat(e.target.value))} 
+                      className="border border-gray-200 rounded-xl px-3 py-2 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent font-medium"
+                    >
+                      <option value="0.5">0.5x Slow</option>
+                      <option value="0.75">0.75x</option>
+                      <option value="1.0">1.0x Normal</option>
+                      <option value="1.25">1.25x</option>
+                      <option value="1.5">1.5x Fast</option>
+                      <option value="2.0">2.0x Very Fast</option>
+                    </select>
                   </label>
                 </div>
 

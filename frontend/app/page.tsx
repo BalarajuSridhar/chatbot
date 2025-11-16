@@ -10,7 +10,7 @@ type AskResponse = { answer: string };
 type STTResponse = { text: string };
 type MsgRole = "user" | "assistant" | "system";
 type Message = { id: string; role: MsgRole; text: string; feedback?: 'good' | 'bad' };
-type LangCode = "en" | "te" | "ta" | "hi";
+type LangCode = "en" | "te" | "ta" | "hi" | "mr" | "kn" | "ml" | "bn";
 
 // AI Model types
 type AIModel = {
@@ -93,6 +93,21 @@ const AI_MODELS: AIModel[] = [
     version: "Latest"
   }
 ];
+
+// Helper function to get language name
+function getLanguageName(code: LangCode): string {
+  const names: Record<LangCode, string> = {
+    "en": "English",
+    "te": "Telugu", 
+    "ta": "Tamil",
+    "hi": "Hindi",
+    "mr": "Marathi",
+    "kn": "Kannada",
+    "ml": "Malayalam",
+    "bn": "Bengali"
+  };
+  return names[code] || code;
+}
 
 // Move API host calculation outside component to avoid hook issues
 function getApiHost() {
@@ -263,9 +278,28 @@ export default function Page() {
     }
   }
 
-  // ... (rest of your STT functions remain the same)
-  function sttLocale(code: LangCode) {
-    return code === "en" ? "en-US" : code === "hi" ? "hi-IN" : code === "te" ? "te-IN" : code === "ta" ? "ta-IN" : "en-US";
+  // ---------- STT Functions ----------
+  function sttLocale(code: LangCode): string {
+    // Browser Speech Recognition has limited language support
+    const supportedMap: Record<LangCode, string> = {
+      "en": "en-US",
+      "hi": "hi-IN",    // Hindi - supported in Chrome
+      "te": "en-US",    // Telugu - not widely supported
+      "ta": "en-US",    // Tamil - not widely supported  
+      "mr": "en-US",    // Marathi - not widely supported
+      "kn": "en-US",    // Kannada - not widely supported
+      "ml": "en-US",    // Malayalam - not widely supported
+      "bn": "en-US"     // Bengali - not widely supported
+    };
+    
+    const locale = supportedMap[code];
+    
+    // Show warning for unsupported languages
+    if (locale === "en-US" && code !== "en") {
+      console.warn(`Browser STT doesn't support ${code}, falling back to English`);
+    }
+    
+    return locale;
   }
 
   function getSpeechRecognitionCtor(): SRConstructor | null {
@@ -281,6 +315,16 @@ export default function Page() {
       startServerRecording();
       return;
     }
+
+    // Check if the language is supported by browser STT
+    const isSupported = ["en", "hi"].includes(language);
+    if (!isSupported) {
+      toast(`${getLanguageName(language)} not supported in browser STT. Using server STT.`);
+      setUseBrowserSTT(false);
+      startServerRecording();
+      return;
+    }
+
     try {
       const rec = new Ctor();
       browserRecRef.current = rec;
@@ -307,8 +351,11 @@ export default function Page() {
       };
       rec.onend = () => {
         setRecording(false);
-        const trimmed = (rec as any).__final || "".trim();
-        if ((trimmed || "").trim()) toast("Transcribed (browser)");
+        const trimmed = finalText.trim();
+        if (trimmed) {
+          setQuestion((prev) => (prev ? `${prev} ${trimmed}` : trimmed));
+          toast("Transcribed (browser)");
+        }
       };
 
       rec.start();
@@ -947,6 +994,10 @@ export default function Page() {
                     <option value="te">🇮🇳 Telugu</option>
                     <option value="ta">🇮🇳 Tamil</option>
                     <option value="hi">🇮🇳 Hindi</option>
+                    <option value="mr">🇮🇳 Marathi</option>
+                    <option value="kn">🇮🇳 Kannada</option>
+                    <option value="ml">🇮🇳 Malayalam</option>
+                    <option value="bn">🇮🇳 Bengali</option>
                   </select>
                 </label>
 
@@ -978,6 +1029,7 @@ export default function Page() {
                   />
                   <span className="hidden sm:inline">Browser Speech Recognition</span>
                   <span className="sm:hidden">Browser STT</span>
+                  <span className="text-xs text-gray-500 hidden sm:inline">(Only EN, HI supported)</span>
                 </label>
               </div>
 
