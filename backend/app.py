@@ -1003,6 +1003,7 @@ async def submit_feedback(feedback: FeedbackRequest):
                 answer=feedback.answer,
                 dataset=None,
                 language=None,
+                model_used=None,  # Will be updated if needed
                 timestamp=timestamp
             )
             session.add(feedback_entry)

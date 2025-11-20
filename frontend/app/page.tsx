@@ -12,7 +12,8 @@ type Message = {
   id: string; 
   role: MsgRole; 
   text: string; 
-  feedback?: 'good' | 'bad' | 'no_response'  // Updated to include 'no_response'
+  feedback?: 'good' | 'bad' | 'no_response';
+  model?: string; // Add model info to messages
 };
 type LangCode = "en" | "te" | "ta" | "hi" | "mr" | "kn" | "ml" | "bn";
 
@@ -25,6 +26,7 @@ type AIModel = {
   icon: string;
   version: string;
   isPopular?: boolean;
+  available?: boolean;
 };
 
 // --- Minimal Web Speech API types so TS doesn't require lib.dom ---
@@ -57,13 +59,14 @@ type BlobEvent = Event & {
 const AI_MODELS: AIModel[] = [
   // OpenAI GPT Models
   {
-    id: "gpt-4o-mini",
+    id: "openai",
     name: "GPT-4o Mini", 
     provider: "OpenAI",
     description: "Fast and cost-effective GPT-4 model",
     icon: "🤖",
     version: "Latest",
-    isPopular: true
+    isPopular: true,
+    available: true
   },
   {
     id: "gpt-4-turbo",
@@ -71,35 +74,19 @@ const AI_MODELS: AIModel[] = [
     provider: "OpenAI",
     description: "Advanced reasoning and problem solving",
     icon: "⚡", 
-    version: "Latest"
+    version: "Latest",
+    available: true
   },
   
-  // Anthropic Models
+  // Ollama Models
   {
-    id: "claude-3-opus",
-    name: "Claude 3 Opus",
-    provider: "Anthropic",
-    description: "Most powerful Claude model",
-    icon: "🎯",
-    version: "2024"
-  },
-  
-  // Google Models
-  {
-    id: "gemini-1.5-pro",
-    name: "Gemini 1.5 Pro",
-    provider: "Google",
-    description: "Large context window model",
-    icon: "🔮",
-    version: "Latest"
-  },
-  {
-    id: "gemini-1.5-flash",
-    name: "Gemini 1.5 Flash",
-    provider: "Google",
-    description: "Fast and efficient model",
-    icon: "✨",
-    version: "Latest"
+    id: "ollama",
+    name: "Llama 3.1",
+    provider: "Ollama",
+    description: "Local AI model for privacy and offline use",
+    icon: "🦙",
+    version: "8B",
+    available: false // Will be updated dynamically
   }
 ];
 
@@ -140,10 +127,12 @@ export default function Page() {
   const [recording, setRecording] = useState(false);
   const [playbackSpeed, setPlaybackSpeed] = useState<number>(1.5);
   const [selectedModel, setSelectedModel] = useState<AIModel>(AI_MODELS[0]);
+  const [availableModels, setAvailableModels] = useState<AIModel[]>(AI_MODELS);
   const [showModelSelector, setShowModelSelector] = useState(false);
   const [showModelConfirmation, setShowModelConfirmation] = useState(false);
   const [pendingModel, setPendingModel] = useState<AIModel | null>(null);
   const [showMobileMenu, setShowMobileMenu] = useState(false);
+  const [loadingModels, setLoadingModels] = useState(false);
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -160,8 +149,11 @@ export default function Page() {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, asking]);
 
+  // Fetch datasets and available models
   useEffect(() => {
     let mounted = true;
+    
+    // Fetch datasets
     fetch(`${API_BASE}/datasets`)
       .then((r) => r.json())
       .then((j) => {
@@ -169,13 +161,90 @@ export default function Page() {
         setDatasets(j.datasets || []);
       })
       .catch(() => setDatasets([]));
+
+    // Fetch available models from backend
+    fetchAvailableModels();
+    
     return () => {
       mounted = false;
     };
   }, []);
 
+  // Fetch available models from backend
+const fetchAvailableModels = async () => {
+  setLoadingModels(true);
+  try {
+    console.log('Fetching models from:', `${API_BASE}/models`);
+    
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 5000); // 5 second timeout
+    
+    const res = await fetch(`${API_BASE}/models`, {
+      signal: controller.signal
+    });
+    
+    clearTimeout(timeoutId);
+    
+    if (!res.ok) {
+      console.warn(`Models endpoint returned ${res.status}`);
+      throw new Error(`Failed to fetch models: ${res.status}`);
+    }
+    
+    const data = await res.json();
+    console.log('Received models data:', data);
+    
+    const backendModels = data.models || [];
+    
+    // Update our models with availability from backend
+    const updatedModels = AI_MODELS.map(model => {
+      const backendModel = backendModels.find((m: any) => m.id === model.id);
+      return {
+        ...model,
+        available: backendModel ? backendModel.available : model.id === "openai", // Default OpenAI to available
+        name: backendModel?.name || model.name,
+        description: backendModel?.description || model.description
+      };
+    });
+    
+    setAvailableModels(updatedModels);
+    
+    // Set default model to first available one
+    const firstAvailable = updatedModels.find(m => m.available) || updatedModels[0];
+    setSelectedModel(firstAvailable);
+    
+  } catch (error) {
+    console.warn("Failed to fetch models, using defaults:", error);
+    
+    // Fallback to default models
+    const fallbackModels = AI_MODELS.map(model => ({
+      ...model,
+      available: model.id === "openai" // Only enable OpenAI by default
+    }));
+    
+    setAvailableModels(fallbackModels);
+    setSelectedModel(fallbackModels[0]);
+    
+    // Only show toast for network errors, not for aborted requests
+    if ((error as any)?.name !== 'AbortError') {
+      toast("Using default models - backend unavailable");
+    }
+  } finally {
+    setLoadingModels(false);
+  }
+};
+
   // ---------- AI Model Selection ----------
   const handleModelSelect = (model: AIModel) => {
+    if (!model.available) {
+      toast(`${model.name} is currently unavailable`);
+      return;
+    }
+    
+    if (model.id === selectedModel.id) {
+      setShowModelSelector(false);
+      return;
+    }
+    
     setPendingModel(model);
     setShowModelConfirmation(true);
     setShowModelSelector(false);
@@ -185,6 +254,13 @@ export default function Page() {
     if (pendingModel) {
       setSelectedModel(pendingModel);
       toast(`Switched to ${pendingModel.name}`);
+      
+      // Add model info to the next assistant message
+      setMessages(prev => prev.map(msg => 
+        msg.role === 'assistant' && !msg.model 
+          ? { ...msg, model: pendingModel.id }
+          : msg
+      ));
     }
     setShowModelConfirmation(false);
     setPendingModel(null);
@@ -199,9 +275,17 @@ export default function Page() {
   async function handleAsk() {
     const q = question.trim();
     if (!q) return toast("Type a question first.");
-    setMessages((p) => [...p, { id: uid(), role: "user", text: q }]);
+    
+    // Add user message with current model context
+    setMessages((p) => [...p, { 
+      id: uid(), 
+      role: "user", 
+      text: q 
+    }]);
+    
     setQuestion("");
     setAsking(true);
+    
     try {
       const res = await fetch(`${API_BASE}/ask`, {
         method: "POST",
@@ -214,13 +298,27 @@ export default function Page() {
           model: selectedModel.id // Send selected model to backend
         }),
       });
+      
       if (!res.ok) throw new Error(await safeText(res));
       const data = (await res.json()) as AskResponse;
-      setMessages((p) => [...p, { id: uid(), role: "assistant", text: data.answer || "(no answer)" }]);
+      
+      // Add assistant message with model info
+      setMessages((p) => [...p, { 
+        id: uid(), 
+        role: "assistant", 
+        text: data.answer || "(no answer)",
+        model: selectedModel.id // Store model info with response
+      }]);
+      
     } catch (e) {
       setMessages((p) => [
         ...p,
-        { id: uid(), role: "assistant", text: `Error: ${errorMessage(e) || "Ask failed"}` },
+        { 
+          id: uid(), 
+          role: "assistant", 
+          text: `Error: ${errorMessage(e) || "Ask failed"}`,
+          model: selectedModel.id
+        },
       ]);
     } finally {
       setAsking(false);
@@ -278,6 +376,7 @@ export default function Page() {
     ));
     
     try {
+      const message = messages.find(m => m.id === messageId);
       await fetch(`${API_BASE}/feedback`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -286,6 +385,7 @@ export default function Page() {
           feedback,
           question: question || messages.find(m => m.id === messageId)?.text,
           answer: answer || messages.find(m => m.id === messageId && m.role === 'assistant')?.text,
+          model_used: message?.model || selectedModel.id, // Include model info in feedback
           timestamp: new Date().toISOString()
         }),
       });
@@ -496,6 +596,24 @@ export default function Page() {
     setMessages([{ id: uid(), role: "system", text: "Upload PDFs in Admin, then ask questions about them." }]);
   }
 
+  // Refresh models
+  function refreshModels() {
+    fetchAvailableModels();
+    toast("Refreshing available models...");
+  }
+
+  // Get model display name
+  function getModelDisplayName(modelId: string): string {
+    const model = availableModels.find(m => m.id === modelId);
+    return model ? model.name : modelId;
+  }
+
+  // Get model icon
+  function getModelIcon(modelId: string): string {
+    const model = availableModels.find(m => m.id === modelId);
+    return model ? model.icon : "🤖";
+  }
+
   // ---------- UI ----------
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-50 via-blue-50 to-indigo-50 flex flex-col overflow-hidden">
@@ -547,10 +665,17 @@ export default function Page() {
                 <button
                   onClick={() => setShowModelSelector(!showModelSelector)}
                   className="px-4 py-2.5 rounded-xl border border-teal-200 bg-gradient-to-r from-teal-50 to-blue-50 text-teal-800 font-semibold text-sm shadow-sm hover:shadow-md transition-all duration-200 flex items-center gap-2 active:scale-95 hover:from-teal-100 hover:to-blue-100"
+                  disabled={loadingModels}
                 >
-                  <span className="text-lg">{selectedModel.icon}</span>
-                  <span className="hidden lg:inline">{selectedModel.name}</span>
-                  <span className="lg:hidden">Model</span>
+                  {loadingModels ? (
+                    <div className="w-4 h-4 border-2 border-teal-600 border-t-transparent rounded-full animate-spin"></div>
+                  ) : (
+                    <>
+                      <span className="text-lg">{selectedModel.icon}</span>
+                      <span className="hidden lg:inline">{selectedModel.name}</span>
+                      <span className="lg:hidden">Model</span>
+                    </>
+                  )}
                   <svg className={`w-4 h-4 transition-transform ${showModelSelector ? 'rotate-180' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
                   </svg>
@@ -562,25 +687,39 @@ export default function Page() {
                     <div className="p-4">
                       <div className="flex items-center justify-between mb-3">
                         <h3 className="font-bold text-gray-900 text-lg">Select AI Model</h3>
-                        <button 
-                          onClick={() => setShowModelSelector(false)}
-                          className="p-1.5 hover:bg-gray-100 rounded-xl transition-colors"
-                        >
-                          <svg className="w-5 h-5 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-                          </svg>
-                        </button>
+                        <div className="flex items-center gap-2">
+                          <button 
+                            onClick={refreshModels}
+                            className="p-1.5 hover:bg-gray-100 rounded-xl transition-colors"
+                            title="Refresh models"
+                          >
+                            <svg className="w-4 h-4 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                            </svg>
+                          </button>
+                          <button 
+                            onClick={() => setShowModelSelector(false)}
+                            className="p-1.5 hover:bg-gray-100 rounded-xl transition-colors"
+                          >
+                            <svg className="w-5 h-5 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                            </svg>
+                          </button>
+                        </div>
                       </div>
                       
                       <div className="space-y-3">
-                        {AI_MODELS.map((model) => (
+                        {availableModels.map((model) => (
                           <button
                             key={model.id}
                             onClick={() => handleModelSelect(model)}
+                            disabled={!model.available}
                             className={`w-full p-4 rounded-xl border-2 transition-all duration-200 text-left hover:shadow-lg group ${
                               selectedModel.id === model.id
                                 ? 'border-blue-500 bg-blue-50 shadow-md scale-[1.02]'
-                                : 'border-gray-200 bg-white hover:border-blue-300 hover:scale-[1.01]'
+                                : model.available
+                                ? 'border-gray-200 bg-white hover:border-blue-300 hover:scale-[1.01]'
+                                : 'border-gray-100 bg-gray-50 opacity-60 cursor-not-allowed'
                             }`}
                           >
                             <div className="flex items-center justify-between">
@@ -589,6 +728,9 @@ export default function Page() {
                                 <div>
                                   <div className="font-semibold text-gray-900 text-sm">
                                     {model.name}
+                                    {!model.available && (
+                                      <span className="ml-2 text-xs text-gray-500">(Unavailable)</span>
+                                    )}
                                   </div>
                                   <div className="text-xs text-gray-500">
                                     {model.provider} • {model.version}
@@ -735,18 +877,24 @@ export default function Page() {
                         <select 
                           value={selectedModel.id}
                           onChange={(e) => {
-                            const model = AI_MODELS.find(m => m.id === e.target.value);
-                            if (model) {
+                            const model = availableModels.find(m => m.id === e.target.value);
+                            if (model && model.available) {
                               setSelectedModel(model);
                               toast(`Switched to ${model.name}`);
+                            } else if (model) {
+                              toast(`${model.name} is currently unavailable`);
                             }
                             setShowMobileMenu(false);
                           }}
                           className="w-full border-2 border-gray-200 rounded-xl px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 bg-white font-medium"
                         >
-                          {AI_MODELS.map((model) => (
-                            <option key={model.id} value={model.id}>
-                              {model.icon} {model.name} ({model.provider})
+                          {availableModels.map((model) => (
+                            <option 
+                              key={model.id} 
+                              value={model.id}
+                              disabled={!model.available}
+                            >
+                              {model.icon} {model.name} {!model.available && '(Unavailable)'}
                             </option>
                           ))}
                         </select>
@@ -868,9 +1016,11 @@ export default function Page() {
                         {m.role === "assistant" ? (
                           <>
                             <div className="w-5 h-5 sm:w-6 sm:h-6 rounded-full bg-gradient-to-r from-teal-400 to-blue-500 flex items-center justify-center">
-                              <span className="text-xs text-white">{selectedModel.icon}</span>
+                              <span className="text-xs text-white">{getModelIcon(m.model || selectedModel.id)}</span>
                             </div>
-                            <span className="text-xs font-semibold">{selectedModel.name}</span>
+                            <span className="text-xs font-semibold">
+                              {getModelDisplayName(m.model || selectedModel.id)}
+                            </span>
                           </>
                         ) : (
                           <>

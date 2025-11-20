@@ -9,8 +9,24 @@ const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
 type AskResponse = { answer: string };
 type STTResponse = { text: string };
 type MsgRole = "user" | "assistant" | "system";
-type Message = { id: string; role: MsgRole; text: string; feedback?: 'good' | 'bad' | 'no_response' };
+type Message = { 
+  id: string; 
+  role: MsgRole; 
+  text: string; 
+  feedback?: 'good' | 'bad' | 'no_response';
+  model?: string; // Add model info to messages
+};
 type LangCode = "en" | "te" | "ta" | "hi" | "mr" | "kn" | "ml" | "bn";
+
+// AI Model types
+type AIModel = {
+  id: string;
+  name: string;
+  provider: string;
+  description: string;
+  icon: string;
+  available: boolean;
+};
 
 // Logs types
 type LogRow = {
@@ -19,6 +35,7 @@ type LogRow = {
   answer?: string;
   dataset?: string | null;
   language?: string | null;
+  model_used?: string | null; // Add model info to logs
   created_at: string;
   feedback?: 'good' | 'bad' | 'no_response';
 };
@@ -32,6 +49,7 @@ type FeedbackLog = {
   answer?: string;
   dataset?: string | null;
   language?: string | null;
+  model_used?: string | null; // Add model info to feedback
   timestamp: string;
   created_at: string;
 };
@@ -120,6 +138,12 @@ function getLanguageName(code: LangCode): string {
   return names[code] || code;
 }
 
+// Helper function to get model display name
+function getModelDisplayName(modelId: string, availableModels: AIModel[]): string {
+  const model = availableModels.find(m => m.id === modelId);
+  return model ? model.name : modelId;
+}
+
 export default function AdminDashboard() {
   const [files, setFiles] = useState<File[]>([]);
   const [uploadedFiles, setUploadedFiles] = useState<FileInfo[]>([]);
@@ -142,6 +166,10 @@ export default function AdminDashboard() {
   const [recording, setRecording] = useState(false);
   const [uploadMessage, setUploadMessage] = useState("");
   const [ttsSpeed, setTtsSpeed] = useState<number>(1.0);
+
+  // AI Model state
+  const [availableModels, setAvailableModels] = useState<AIModel[]>([]);
+  const [selectedModel, setSelectedModel] = useState<string>("openai");
 
   // TTS state variables
   const [ttsPlaying, setTtsPlaying] = useState(false);
@@ -196,9 +224,11 @@ export default function AdminDashboard() {
     }
   }, [router]);
 
-  // fetch datasets once
+  // fetch datasets and models once
   useEffect(() => {
     let mounted = true;
+    
+    // Fetch datasets
     fetch(`${API_BASE}/datasets`)
       .then((r) => r.json())
       .then((j) => {
@@ -206,6 +236,22 @@ export default function AdminDashboard() {
         setDatasets(j.datasets || []);
       })
       .catch(() => setDatasets([]));
+
+    // Fetch available models
+    fetch(`${API_BASE}/models`)
+      .then((r) => r.json())
+      .then((j) => {
+        if (!mounted) return;
+        setAvailableModels(j.models || []);
+        
+        // Set default model to the first available one
+        if (j.models && j.models.length > 0) {
+          const defaultModel = j.models.find((m: AIModel) => m.available) || j.models[0];
+          setSelectedModel(defaultModel.id);
+        }
+      })
+      .catch(() => setAvailableModels([]));
+      
     return () => {
       mounted = false;
     };
@@ -444,22 +490,51 @@ export default function AdminDashboard() {
   const handleAsk = async () => {
     const q = question.trim();
     if (!q) return toast("Type or dictate a question first.");
-    setMessages((prev) => [...prev, { id: uid(), role: "user", text: q }]);
+    
+    // Add model info to the user message
+    const selectedModelInfo = availableModels.find(m => m.id === selectedModel);
+    const modelLabel = selectedModelInfo ? ` (${selectedModelInfo.name})` : '';
+    
+    setMessages((prev) => [...prev, { 
+      id: uid(), 
+      role: "user", 
+      text: q,
+      model: selectedModel // Store model info with message
+    }]);
+    
     setQuestion("");
     try {
       setAsking(true);
       const res = await fetch(`${API_BASE}/ask`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question: q, top_k: 4, language, dataset: dataset || undefined }),
+        body: JSON.stringify({ 
+          question: q, 
+          top_k: 4, 
+          language, 
+          dataset: dataset || undefined,
+          model: selectedModel // Send model selection to backend
+        }),
       });
       if (!res.ok) throw new Error(await safeText(res));
       const data = (await res.json()) as AskResponse;
-      setMessages((prev) => [...prev, { id: uid(), role: "assistant", text: data.answer || "(no answer)" }]);
+      
+      // Add model info to assistant message
+      setMessages((prev) => [...prev, { 
+        id: uid(), 
+        role: "assistant", 
+        text: data.answer || "(no answer)",
+        model: selectedModel // Store model info with response
+      }]);
     } catch (err: unknown) {
       setMessages((prev) => [
         ...prev,
-        { id: uid(), role: "assistant", text: `Error: ${errorMessage(err) || "Failed to ask"}` },
+        { 
+          id: uid(), 
+          role: "assistant", 
+          text: `Error: ${errorMessage(err) || "Failed to ask"}`,
+          model: selectedModel
+        },
       ]);
     } finally {
       setAsking(false);
@@ -1077,6 +1152,16 @@ export default function AdminDashboard() {
                               : "bg-white/90 text-gray-800 rounded-bl-md border-gray-100"
                           }`}
                         >
+                          {/* Add model indicator for assistant messages */}
+                          {m.role === "assistant" && m.model && (
+                            <div className="flex items-center gap-2 mb-2 text-xs">
+                              <span className="px-2 py-1 bg-blue-100 text-blue-700 rounded-full font-medium">
+                                {availableModels.find(model => model.id === m.model)?.icon} 
+                                {availableModels.find(model => model.id === m.model)?.provider}
+                              </span>
+                            </div>
+                          )}
+                          
                           <div className="text-sm">{m.text}</div>
                           
                           {/* Assistant Actions with Feedback */}
@@ -1187,6 +1272,26 @@ export default function AdminDashboard() {
               {/* Input Area */}
               <div className="space-y-4">
                 <div className="flex flex-wrap items-center gap-4 text-sm">
+                  {/* AI Model Selection */}
+                  <label className="flex items-center gap-2 font-medium text-gray-700">
+                    <span>AI Model:</span>
+                    <select 
+                      value={selectedModel} 
+                      onChange={(e) => setSelectedModel(e.target.value)} 
+                      className="border border-gray-200 rounded-xl px-3 py-2 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent font-medium"
+                    >
+                      {availableModels.map((model) => (
+                        <option 
+                          key={model.id} 
+                          value={model.id}
+                          disabled={!model.available}
+                        >
+                          {model.icon} {model.name} {!model.available ? '(Unavailable)' : ''}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+
                   <label className="flex items-center gap-2 font-medium text-gray-700">
                     <span>Answer language:</span>
                     <select 
@@ -1333,7 +1438,10 @@ export default function AdminDashboard() {
                       <div className="text-xs text-gray-500 mb-1">{new Date(l.created_at).toLocaleString()}</div>
                       <div className="text-sm font-medium text-gray-800 truncate mb-1">{l.question}</div>
                       <div className="flex items-center justify-between text-xs text-gray-400">
-                        <span>{l.dataset ?? "(All datasets)"} • {l.language ?? "en"}</span>
+                        <span>
+                          {l.dataset ?? "(All datasets)"} • {l.language ?? "en"}
+                          {l.model_used && ` • ${l.model_used.toUpperCase()}`}
+                        </span>
                         {l.feedback && (
                           <span className={`px-1.5 py-0.5 rounded-full text-xs ${
                             l.feedback === 'good' ? 'bg-green-100 text-green-700' : 
@@ -1380,6 +1488,12 @@ export default function AdminDashboard() {
                     </div>
                     <div>
                       <span className="font-medium">Language:</span> {selectedLog.language ?? "en"}
+                    </div>
+                    <div>
+                      <span className="font-medium">Model:</span> 
+                      <span className="ml-2 px-2 py-1 bg-blue-100 text-blue-700 rounded-full text-xs font-medium">
+                        {selectedLog.model_used ? selectedLog.model_used.toUpperCase() : "OpenAI"}
+                      </span>
                     </div>
                     {selectedLog.feedback && (
                       <div>
@@ -1592,6 +1706,7 @@ export default function AdminDashboard() {
                             <div className="font-semibold text-gray-800 capitalize">{log.feedback_type.replace('_', ' ')}</div>
                             <div className="text-xs text-gray-500">
                               {new Date(log.timestamp).toLocaleString()} • Message ID: {log.message_id}
+                              {log.model_used && ` • Model: ${log.model_used.toUpperCase()}`}
                             </div>
                           </div>
                         </div>
@@ -1623,6 +1738,9 @@ export default function AdminDashboard() {
                         )}
                         {log.language && (
                           <span>Language: <span className="font-medium">{getLanguageName(log.language as LangCode)}</span></span>
+                        )}
+                        {log.model_used && (
+                          <span>Model: <span className="font-medium">{log.model_used.toUpperCase()}</span></span>
                         )}
                       </div>
                     </div>
