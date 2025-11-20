@@ -1,7 +1,7 @@
 // app/admin/login/page.tsx
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
@@ -11,7 +11,30 @@ export default function LoginPage() {
   const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [apiHost, setApiHost] = useState("");
   const router = useRouter();
+
+  // Remove form automation attributes on client-side only
+  useEffect(() => {
+    // Remove fdprocessedid attributes that cause hydration errors
+    const removeFormAttributes = () => {
+      document.querySelectorAll('[fdprocessedid]').forEach(el => {
+        el.removeAttribute('fdprocessedid');
+      });
+    };
+
+    // Calculate API host on client side only
+    try {
+      setApiHost(new URL(API_BASE).host);
+    } catch {
+      setApiHost(API_BASE);
+    }
+
+    // Run after a short delay to ensure DOM is fully loaded
+    const timer = setTimeout(removeFormAttributes, 100);
+    
+    return () => clearTimeout(timer);
+  }, []);
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
@@ -100,8 +123,9 @@ export default function LoginPage() {
                     value={username}
                     onChange={(e) => setUsername(e.target.value)}
                     placeholder="Username"
-                    className="w-full border border-gray-200 rounded-2xl px-6 py-4 text-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent bg-white/50 backdrop-blur-sm font-medium placeholder-gray-400"
+                    className="w-full border border-gray-200 rounded-2xl px-6 py-4 text-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent bg-white/50 backdrop-blur-sm font-medium placeholder-gray-400 transition-colors hover:border-gray-300"
                     disabled={loading}
+                    suppressHydrationWarning
                   />
                   <div className="absolute inset-y-0 right-0 pr-3 flex items-center">
                     <svg className="h-5 w-5 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -122,8 +146,9 @@ export default function LoginPage() {
                     onChange={(e) => setPassword(e.target.value)}
                     placeholder="Password"
                     type="password"
-                    className="w-full border border-gray-200 rounded-2xl px-6 py-4 text-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent bg-white/50 backdrop-blur-sm font-medium placeholder-gray-400"
+                    className="w-full border border-gray-200 rounded-2xl px-6 py-4 text-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent bg-white/50 backdrop-blur-sm font-medium placeholder-gray-400 transition-colors hover:border-gray-300"
                     disabled={loading}
+                    suppressHydrationWarning
                   />
                   <div className="absolute inset-y-0 right-0 pr-3 flex items-center">
                     <svg className="h-5 w-5 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -136,7 +161,8 @@ export default function LoginPage() {
               <button
                 type="submit"
                 disabled={loading}
-                className="w-full px-8 py-4 rounded-2xl bg-gradient-to-r from-blue-600 to-blue-700 text-white hover:from-blue-700 hover:to-blue-800 disabled:from-gray-400 disabled:to-gray-500 transition-all duration-200 font-semibold text-lg shadow-lg hover:shadow-xl disabled:shadow-none transform hover:scale-105 disabled:scale-100"
+                className="w-full px-8 py-4 rounded-2xl bg-gradient-to-r from-blue-600 to-blue-700 text-white hover:from-blue-700 hover:to-blue-800 disabled:from-gray-400 disabled:to-gray-500 transition-all duration-200 font-semibold text-lg shadow-lg hover:shadow-xl disabled:shadow-none transform hover:scale-105 disabled:scale-100 active:scale-95"
+                suppressHydrationWarning
               >
                 {loading ? (
                   <div className="flex items-center justify-center gap-2">
@@ -155,17 +181,22 @@ export default function LoginPage() {
             <button
               type="button"
               onClick={() => router.push("/")}
-              className="text-sm text-gray-600 hover:text-gray-900 transition-colors duration-200 font-medium"
+              className="text-sm text-gray-600 hover:text-gray-900 transition-colors duration-200 font-medium flex items-center justify-center gap-2 mx-auto"
+              suppressHydrationWarning
             >
-              ← Back to MSME Assistant
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 19l-7-7m0 0l7-7m-7 7h18" />
+              </svg>
+              Back to MSME Assistant
             </button>
           </div>
         </form>
 
         {/* API Info */}
         <div className="text-center">
-          <div className="text-xs text-gray-500 inline-block px-3 py-2 rounded-full border border-blue-200/50 bg-white/80 backdrop-blur-sm">
-            API: {new URL(API_BASE).host || API_BASE}
+          <div className="text-xs text-gray-500 inline-flex items-center gap-2 px-3 py-2 rounded-full border border-blue-200/50 bg-white/80 backdrop-blur-sm">
+            <div className="w-2 h-2 bg-green-500 rounded-full animate-pulse"></div>
+            API: {apiHost || "Loading..."}
           </div>
         </div>
       </div>

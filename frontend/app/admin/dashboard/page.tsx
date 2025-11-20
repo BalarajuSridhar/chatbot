@@ -1,3 +1,4 @@
+// app/admin/dashboard/page.tsx
 "use client";
 
 import { useRouter } from "next/navigation";
@@ -8,7 +9,7 @@ const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
 type AskResponse = { answer: string };
 type STTResponse = { text: string };
 type MsgRole = "user" | "assistant" | "system";
-type Message = { id: string; role: MsgRole; text: string; feedback?: 'good' | 'bad' };
+type Message = { id: string; role: MsgRole; text: string; feedback?: 'good' | 'bad' | 'no_response' };
 type LangCode = "en" | "te" | "ta" | "hi" | "mr" | "kn" | "ml" | "bn";
 
 // Logs types
@@ -19,7 +20,35 @@ type LogRow = {
   dataset?: string | null;
   language?: string | null;
   created_at: string;
-  feedback?: 'good' | 'bad';
+  feedback?: 'good' | 'bad' | 'no_response';
+};
+
+// Feedback logs types
+type FeedbackLog = {
+  id: number;
+  message_id: string;
+  feedback_type: 'good' | 'bad' | 'no_response';
+  question?: string;
+  answer?: string;
+  dataset?: string | null;
+  language?: string | null;
+  timestamp: string;
+  created_at: string;
+};
+
+type FeedbackStats = {
+  total: number;
+  good: number;
+  bad: number;
+  no_response: number;
+};
+
+type DailyTrend = {
+  date: string;
+  good: number;
+  bad: number;
+  no_response: number;
+  total: number;
 };
 
 // File management types
@@ -112,20 +141,38 @@ export default function AdminDashboard() {
   const [useBrowserSTT, setUseBrowserSTT] = useState(true);
   const [recording, setRecording] = useState(false);
   const [uploadMessage, setUploadMessage] = useState("");
-  const [ttsSpeed, setTtsSpeed] = useState<number>(1.0); // TTS speed control
+  const [ttsSpeed, setTtsSpeed] = useState<number>(1.0);
 
-  // Logs state
-  const [tab, setTab] = useState<"upload" | "chat" | "logs" | "files">("upload");
+  // TTS state variables
+  const [ttsPlaying, setTtsPlaying] = useState(false);
+  const [pausedAudioUrl, setPausedAudioUrl] = useState<string | null>(null);
+  const [pausedTime, setPausedTime] = useState<number>(0);
+
+  // Logs & Feedback state
+  const [tab, setTab] = useState<"upload" | "chat" | "logs" | "files" | "feedback">("upload");
   const [logs, setLogs] = useState<LogRow[]>([]);
   const [selectedLog, setSelectedLog] = useState<LogRow | null>(null);
   const [loadingLogs, setLoadingLogs] = useState(false);
   const [loadingFiles, setLoadingFiles] = useState(false);
+
+  // Feedback logs state
+  const [feedbackLogs, setFeedbackLogs] = useState<FeedbackLog[]>([]);
+  const [feedbackStats, setFeedbackStats] = useState<FeedbackStats>({ total: 0, good: 0, bad: 0, no_response: 0 });
+  const [dailyTrends, setDailyTrends] = useState<DailyTrend[]>([]);
+  const [loadingFeedback, setLoadingFeedback] = useState(false);
+  const [feedbackFilter, setFeedbackFilter] = useState<string>("all");
+  const [feedbackLimit, setFeedbackLimit] = useState<number>(100);
+  const [feedbackOffset, setFeedbackOffset] = useState<number>(0);
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<BlobPart[]>([]);
   const browserRecRef = useRef<SR | null>(null);
   const bottomRef = useRef<HTMLDivElement | null>(null);
   const messagesContainerRef = useRef<HTMLDivElement | null>(null);
+
+  // Audio refs
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const lastAudioUrlRef = useRef<string | null>(null);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -163,6 +210,159 @@ export default function AdminDashboard() {
       mounted = false;
     };
   }, []);
+
+  // Load data when tab changes
+  useEffect(() => {
+    if (tab === "logs") {
+      fetchLogs();
+    } else if (tab === "files") {
+      fetchUploadedFiles();
+    } else if (tab === "feedback") {
+      fetchFeedbackLogs();
+      fetchFeedbackStats();
+    }
+  }, [tab]);
+
+  // ---------- TTS Functions ----------
+  function cleanupAudio() {
+    try {
+      if (audioRef.current) {
+        try {
+          audioRef.current.pause();
+          audioRef.current.currentTime = 0;
+        } catch {}
+        audioRef.current = null;
+      }
+      if (lastAudioUrlRef.current) {
+        try { URL.revokeObjectURL(lastAudioUrlRef.current); } catch {}
+        lastAudioUrlRef.current = null;
+      }
+      setPausedAudioUrl(null);
+      setPausedTime(0);
+    } catch (e) {}
+  }
+
+  async function playTTS(text: string) {
+    try {
+      if (!text) return;
+
+      // If we have a paused audio, resume it
+      if (pausedAudioUrl && pausedTime > 0) {
+        const a = new Audio(pausedAudioUrl);
+        audioRef.current = a;
+        a.currentTime = pausedTime;
+        a.onended = () => {
+          cleanupAudio();
+          setTtsPlaying(false);
+        };
+        await a.play();
+        setTtsPlaying(true);
+        return;
+      }
+
+      // If an audio is already playing, stop it and revoke its URL
+      if (audioRef.current) {
+        try {
+          audioRef.current.pause();
+        } catch {}
+        cleanupAudio();
+      }
+
+      const res = await fetch(`${API_BASE}/tts`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ 
+          text, 
+          language,
+          speed: ttsSpeed 
+        }),
+      });
+      if (!res.ok) throw new Error(await safeText(res));
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+
+      // store the last URL so we can revoke it later
+      lastAudioUrlRef.current = url;
+
+      const a = new Audio(url);
+      audioRef.current = a;
+      a.onended = () => {
+        cleanupAudio();
+        setTtsPlaying(false);
+      };
+      await a.play();
+      setTtsPlaying(true);
+    } catch (e) {
+      toast("TTS failed");
+      console.error(e);
+      setTtsPlaying(false);
+    }
+  }
+
+  function pauseResumeTTS() {
+    try {
+      if (audioRef.current) {
+        if (!audioRef.current.paused) {
+          // Pause the audio and store state for resuming
+          audioRef.current.pause();
+          setPausedTime(audioRef.current.currentTime);
+          if (lastAudioUrlRef.current) {
+            setPausedAudioUrl(lastAudioUrlRef.current);
+          }
+          setTtsPlaying(false);
+        } else {
+          // Resume the audio
+          audioRef.current.play();
+          setTtsPlaying(true);
+        }
+        return;
+      }
+
+      // If no audio ref but we have paused state, try to resume
+      if (pausedAudioUrl && pausedTime > 0) {
+        const a = new Audio(pausedAudioUrl);
+        audioRef.current = a;
+        a.currentTime = pausedTime;
+        a.onended = () => {
+          cleanupAudio();
+          setTtsPlaying(false);
+        };
+        a.play();
+        setTtsPlaying(true);
+        return;
+      }
+
+      // fallback: pause any <audio> elements that are in the DOM
+      const audioElements = document.querySelectorAll('audio');
+      let foundPlaying = false;
+      audioElements.forEach(audio => {
+        if (!audio.paused) {
+          audio.pause();
+          foundPlaying = true;
+        }
+      });
+      
+      if (foundPlaying) {
+        setTtsPlaying(false);
+      }
+    } catch (e) {
+      console.error("Error in pauseResumeTTS:", e);
+    }
+  }
+
+  function stopTTS() {
+    cleanupAudio();
+    setTtsPlaying(false);
+    
+    // fallback: stop any <audio> elements that are in the DOM
+    const audioElements = document.querySelectorAll('audio');
+    audioElements.forEach(audio => {
+      try { 
+        (audio as HTMLAudioElement).pause(); 
+        (audio as HTMLAudioElement).currentTime = 0; 
+      } catch {}
+    });
+  }
 
   // ---------- File handlers ----------
   const onDrop = (e: React.DragEvent<HTMLDivElement>) => {
@@ -266,41 +466,8 @@ export default function AdminDashboard() {
     }
   };
 
-  // ---------- TTS ----------
-  async function playTTS(text: string) {
-    try {
-      if (!text) return;
-      const res = await fetch(`${API_BASE}/tts`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ 
-          text, 
-          language,
-          speed: ttsSpeed 
-        }),
-      });
-      if (!res.ok) throw new Error(await safeText(res));
-      const blob = await res.blob();
-      const url = URL.createObjectURL(blob);
-      const a = new Audio(url);
-      a.onended = () => URL.revokeObjectURL(url);
-      await a.play();
-    } catch (e) {
-      toast("TTS failed");
-      console.error(e);
-    }
-  }
-
-  function stopTTS() {
-    try {
-      // Stop any playing audio
-      const audioElements = document.querySelectorAll('audio');
-      audioElements.forEach(audio => audio.pause());
-    } catch {}
-  }
-
   // ---------- Feedback ----------
-  async function handleFeedback(messageId: string, feedback: 'good' | 'bad') {
+  async function handleFeedback(messageId: string, feedback: 'good' | 'bad' | 'no_response') {
     setMessages(prev => prev.map(msg => 
       msg.id === messageId ? { ...msg, feedback } : msg
     ));
@@ -315,9 +482,15 @@ export default function AdminDashboard() {
           timestamp: new Date().toISOString()
         }),
       });
-      toast(`Feedback ${feedback === 'good' ? '👍' : '👎'} recorded`);
+      const feedbackText = {
+        'good': '👍 Helpful',
+        'bad': '👎 Not Helpful', 
+        'no_response': '⏸️ No Response'
+      }[feedback];
+      toast(`Feedback recorded: ${feedbackText}`);
     } catch (e) {
       console.error("Failed to send feedback:", e);
+      toast("Failed to record feedback");
     }
   }
 
@@ -453,6 +626,77 @@ export default function AdminDashboard() {
   function pickLog(l: LogRow) {
     setSelectedLog(l);
     setTab("logs");
+  }
+
+  // ---------- Feedback Logs ----------
+  async function fetchFeedbackLogs() {
+    setLoadingFeedback(true);
+    try {
+      const token = localStorage.getItem("admin_token");
+      let url = `${API_BASE}/admin/feedback-logs?limit=${feedbackLimit}&offset=${feedbackOffset}`;
+      if (feedbackFilter !== "all") {
+        url += `&feedback_type=${feedbackFilter}`;
+      }
+      
+      const res = await fetch(url, {
+        headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+      });
+      
+      if (res.status === 401) {
+        localStorage.removeItem("admin_token");
+        router.push("/admin/login");
+        return;
+      }
+      
+      if (!res.ok) {
+        console.error("Failed to fetch feedback logs:", await res.text());
+        setFeedbackLogs([]);
+        return;
+      }
+      
+      const data = await res.json();
+      setFeedbackLogs(data.feedback_logs || []);
+      setFeedbackStats(data.summary || { total: 0, good: 0, bad: 0, no_response: 0 });
+    } catch (e) {
+      console.error("fetchFeedbackLogs error:", e);
+      setFeedbackLogs([]);
+    } finally {
+      setLoadingFeedback(false);
+    }
+  }
+
+  async function fetchFeedbackStats() {
+    try {
+      const token = localStorage.getItem("admin_token");
+      const res = await fetch(`${API_BASE}/admin/feedback-stats?days=30`, {
+        headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+      });
+      
+      if (res.ok) {
+        const data = await res.json();
+        setDailyTrends(data.daily_trends || []);
+      }
+    } catch (e) {
+      console.error("fetchFeedbackStats error:", e);
+    }
+  }
+
+  function getFeedbackIcon(feedbackType: string) {
+    switch (feedbackType) {
+      case 'good': return '👍';
+      case 'bad': return '👎';
+      case 'no_response': return '⏸️';
+      default: return '❓';
+    }
+  }
+
+  function getFeedbackColor(feedbackType: string) {
+    switch (feedbackType) {
+      case 'good': return 'text-green-600 bg-green-100 border-green-200';
+      case 'bad': return 'text-red-600 bg-red-100 border-red-200';
+      case 'no_response': return 'text-yellow-600 bg-yellow-100 border-yellow-200';
+      default: return 'text-gray-600 bg-gray-100 border-gray-200';
+    }
   }
 
   // ---------- STT helpers ----------
@@ -656,7 +900,8 @@ export default function AdminDashboard() {
                 { id: "upload", label: "Upload" },
                 { id: "chat", label: "Chat" },
                 { id: "logs", label: "User Logs" },
-                { id: "files", label: "File Management" }
+                { id: "files", label: "File Management" },
+                { id: "feedback", label: "Feedback Analytics" }
               ].map(({ id, label }) => (
                 <button 
                   key={id}
@@ -846,10 +1091,17 @@ export default function AdminDashboard() {
                                   Speak
                                 </button>
                                 <button 
-                                  onClick={() => stopTTS()} 
+                                  onClick={pauseResumeTTS} 
                                   className="flex items-center gap-1 px-2 py-1 rounded-full border border-gray-200 bg-white text-gray-700 hover:bg-gray-50 transition-all duration-200 text-xs font-medium"
                                 >
-                                  <span>■</span>
+                                  <span>{ttsPlaying ? '⏸️' : '▶️'}</span>
+                                  {ttsPlaying ? 'Pause' : 'Resume'}
+                                </button>
+                                <button 
+                                  onClick={stopTTS} 
+                                  className="flex items-center gap-1 px-2 py-1 rounded-full border border-gray-200 bg-white text-gray-700 hover:bg-gray-50 transition-all duration-200 text-xs font-medium"
+                                >
+                                  <span>⏹️</span>
                                   Stop
                                 </button>
                                 <button 
@@ -891,6 +1143,19 @@ export default function AdminDashboard() {
                                 >
                                   <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 20 20">
                                     <path fillRule="evenodd" d="M5.293 7.293a1 1 0 011.414 0L10 10.586l3.293-3.293a1 1 0 111.414 1.414l-4 4a1 1 0 01-1.414 0l-4-4a1 1 0 010-1.414z" clipRule="evenodd" />
+                                  </svg>
+                                </button>
+                                <button
+                                  onClick={() => handleFeedback(m.id, 'no_response')}
+                                  className={`p-1.5 rounded-full transition-all duration-200 ${
+                                    m.feedback === 'no_response' 
+                                      ? 'bg-yellow-100 text-yellow-600 border border-yellow-200 shadow-sm' 
+                                      : 'bg-white text-gray-400 hover:text-yellow-500 hover:bg-yellow-50 border border-gray-200 hover:border-yellow-200'
+                                  }`}
+                                  title="No response needed"
+                                >
+                                  <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 9v6m4-6v6m7-3a9 9 0 11-18 0 9 9 0 0118 0z" />
                                   </svg>
                                 </button>
                               </div>
@@ -1071,9 +1336,11 @@ export default function AdminDashboard() {
                         <span>{l.dataset ?? "(All datasets)"} • {l.language ?? "en"}</span>
                         {l.feedback && (
                           <span className={`px-1.5 py-0.5 rounded-full text-xs ${
-                            l.feedback === 'good' ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'
+                            l.feedback === 'good' ? 'bg-green-100 text-green-700' : 
+                            l.feedback === 'bad' ? 'bg-red-100 text-red-700' : 
+                            'bg-yellow-100 text-yellow-700'
                           }`}>
-                            {l.feedback === 'good' ? '👍' : '👎'}
+                            {l.feedback === 'good' ? '👍' : l.feedback === 'bad' ? '👎' : '⏸️'}
                           </span>
                         )}
                       </div>
@@ -1118,9 +1385,13 @@ export default function AdminDashboard() {
                       <div>
                         <span className="font-medium">Feedback:</span> 
                         <span className={`ml-2 px-2 py-1 rounded-full text-xs ${
-                          selectedLog.feedback === 'good' ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'
+                          selectedLog.feedback === 'good' ? 'bg-green-100 text-green-700' : 
+                          selectedLog.feedback === 'bad' ? 'bg-red-100 text-red-700' : 
+                          'bg-yellow-100 text-yellow-700'
                         }`}>
-                          {selectedLog.feedback === 'good' ? 'Helpful 👍' : 'Not Helpful 👎'}
+                          {selectedLog.feedback === 'good' ? 'Helpful 👍' : 
+                           selectedLog.feedback === 'bad' ? 'Not Helpful 👎' : 
+                           'No Response ⏸️'}
                         </span>
                       </div>
                     )}
@@ -1218,6 +1489,236 @@ export default function AdminDashboard() {
                 })}
               </div>
             </div>
+          </section>
+        )}
+
+        {tab === "feedback" && (
+          <section className="space-y-6">
+            {/* Feedback Stats Overview */}
+            <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
+              <div className="rounded-3xl backdrop-blur-lg bg-white/80 border border-white/50 shadow-2xl p-6">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <div className="text-2xl font-bold text-gray-800">{feedbackStats.total}</div>
+                    <div className="text-sm text-gray-600">Total Feedback</div>
+                  </div>
+                  <div className="w-12 h-12 rounded-full bg-blue-100 flex items-center justify-center">
+                    <span className="text-xl">📊</span>
+                  </div>
+                </div>
+              </div>
+
+              <div className="rounded-3xl backdrop-blur-lg bg-white/80 border border-white/50 shadow-2xl p-6">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <div className="text-2xl font-bold text-green-600">{feedbackStats.good}</div>
+                    <div className="text-sm text-gray-600">Helpful 👍</div>
+                  </div>
+                  <div className="w-12 h-12 rounded-full bg-green-100 flex items-center justify-center">
+                    <span className="text-xl">👍</span>
+                  </div>
+                </div>
+              </div>
+
+              <div className="rounded-3xl backdrop-blur-lg bg-white/80 border border-white/50 shadow-2xl p-6">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <div className="text-2xl font-bold text-red-600">{feedbackStats.bad}</div>
+                    <div className="text-sm text-gray-600">Not Helpful 👎</div>
+                  </div>
+                  <div className="w-12 h-12 rounded-full bg-red-100 flex items-center justify-center">
+                    <span className="text-xl">👎</span>
+                  </div>
+                </div>
+              </div>
+
+              <div className="rounded-3xl backdrop-blur-lg bg-white/80 border border-white/50 shadow-2xl p-6">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <div className="text-2xl font-bold text-yellow-600">{feedbackStats.no_response}</div>
+                    <div className="text-sm text-gray-600">No Response ⏸️</div>
+                  </div>
+                  <div className="w-12 h-12 rounded-full bg-yellow-100 flex items-center justify-center">
+                    <span className="text-xl">⏸️</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* Feedback Logs Table */}
+            <div className="rounded-3xl backdrop-blur-lg bg-white/80 border border-white/50 shadow-2xl p-6">
+              <div className="flex items-center justify-between mb-6">
+                <h3 className="text-lg font-bold text-gray-800">Feedback Logs</h3>
+                <div className="flex items-center gap-3">
+                  <select 
+                    value={feedbackFilter}
+                    onChange={(e) => {
+                      setFeedbackFilter(e.target.value);
+                      setFeedbackOffset(0);
+                    }}
+                    className="border border-gray-200 rounded-xl px-3 py-2 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent text-sm"
+                  >
+                    <option value="all">All Feedback</option>
+                    <option value="good">Helpful 👍</option>
+                    <option value="bad">Not Helpful 👎</option>
+                    <option value="no_response">No Response ⏸️</option>
+                  </select>
+                  
+                  <button 
+                    onClick={fetchFeedbackLogs} 
+                    className="px-4 py-2 rounded-xl border border-gray-300 bg-white text-gray-700 hover:bg-gray-50 transition-all duration-200 text-sm font-medium"
+                  >
+                    Refresh
+                  </button>
+                </div>
+              </div>
+
+              {loadingFeedback ? (
+                <div className="flex items-center justify-center py-8">
+                  <div className="w-6 h-6 border-2 border-blue-600 border-t-transparent rounded-full animate-spin"></div>
+                </div>
+              ) : feedbackLogs.length === 0 ? (
+                <div className="text-sm text-gray-500 text-center py-8">No feedback logs yet.</div>
+              ) : (
+                <div className="space-y-4 max-h-96 overflow-auto">
+                  {feedbackLogs.map((log) => (
+                    <div key={log.id} className="p-4 border border-gray-200 rounded-2xl bg-white/50 backdrop-blur-sm">
+                      <div className="flex items-start justify-between mb-3">
+                        <div className="flex items-center gap-3">
+                          <span className={`text-lg ${getFeedbackColor(log.feedback_type).split(' ')[0]}`}>
+                            {getFeedbackIcon(log.feedback_type)}
+                          </span>
+                          <div>
+                            <div className="font-semibold text-gray-800 capitalize">{log.feedback_type.replace('_', ' ')}</div>
+                            <div className="text-xs text-gray-500">
+                              {new Date(log.timestamp).toLocaleString()} • Message ID: {log.message_id}
+                            </div>
+                          </div>
+                        </div>
+                        <span className={`px-2 py-1 rounded-full text-xs font-medium ${getFeedbackColor(log.feedback_type)}`}>
+                          {log.feedback_type === 'good' ? 'Helpful' : 
+                           log.feedback_type === 'bad' ? 'Not Helpful' : 
+                           'No Response'}
+                        </span>
+                      </div>
+                      
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm">
+                        {log.question && (
+                          <div>
+                            <div className="font-medium text-gray-700 mb-1">Question:</div>
+                            <div className="text-gray-600 bg-gray-50 rounded-xl p-3">{log.question}</div>
+                          </div>
+                        )}
+                        {log.answer && (
+                          <div>
+                            <div className="font-medium text-gray-700 mb-1">Answer:</div>
+                            <div className="text-gray-600 bg-gray-50 rounded-xl p-3">{log.answer}</div>
+                          </div>
+                        )}
+                      </div>
+                      
+                      <div className="flex gap-4 mt-3 text-xs text-gray-500">
+                        {log.dataset && (
+                          <span>Dataset: <span className="font-medium">{log.dataset}</span></span>
+                        )}
+                        {log.language && (
+                          <span>Language: <span className="font-medium">{getLanguageName(log.language as LangCode)}</span></span>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* Pagination */}
+              {feedbackLogs.length > 0 && (
+                <div className="flex items-center justify-between mt-6 pt-6 border-t border-gray-200">
+                  <div className="text-sm text-gray-500">
+                    Showing {feedbackOffset + 1} to {Math.min(feedbackOffset + feedbackLimit, feedbackStats.total)} of {feedbackStats.total} entries
+                  </div>
+                  <div className="flex gap-2">
+                    <button
+                      onClick={() => {
+                        const newOffset = Math.max(0, feedbackOffset - feedbackLimit);
+                        setFeedbackOffset(newOffset);
+                      }}
+                      disabled={feedbackOffset === 0}
+                      className="px-3 py-2 rounded-xl border border-gray-300 bg-white text-gray-700 hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed transition-all duration-200 text-sm"
+                    >
+                      Previous
+                    </button>
+                    <button
+                      onClick={() => {
+                        const newOffset = feedbackOffset + feedbackLimit;
+                        setFeedbackOffset(newOffset);
+                      }}
+                      disabled={feedbackOffset + feedbackLimit >= feedbackStats.total}
+                      className="px-3 py-2 rounded-xl border border-gray-300 bg-white text-gray-700 hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed transition-all duration-200 text-sm"
+                    >
+                      Next
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Daily Trends Chart */}
+            {dailyTrends.length > 0 && (
+              <div className="rounded-3xl backdrop-blur-lg bg-white/80 border border-white/50 shadow-2xl p-6">
+                <h3 className="text-lg font-bold text-gray-800 mb-6">Feedback Trends (Last 30 Days)</h3>
+                <div className="space-y-4">
+                  {dailyTrends.slice(-7).map((trend) => (
+                    <div key={trend.date} className="flex items-center justify-between">
+                      <div className="text-sm font-medium text-gray-700 w-24">
+                        {new Date(trend.date).toLocaleDateString()}
+                      </div>
+                      <div className="flex-1 ml-4">
+                        <div className="flex h-6 rounded-full overflow-hidden">
+                          {trend.good > 0 && (
+                            <div 
+                              className="bg-green-500 transition-all duration-300"
+                              style={{ width: `${(trend.good / trend.total) * 100}%` }}
+                              title={`Helpful: ${trend.good}`}
+                            ></div>
+                          )}
+                          {trend.bad > 0 && (
+                            <div 
+                              className="bg-red-500 transition-all duration-300"
+                              style={{ width: `${(trend.bad / trend.total) * 100}%` }}
+                              title={`Not Helpful: ${trend.bad}`}
+                            ></div>
+                          )}
+                          {trend.no_response > 0 && (
+                            <div 
+                              className="bg-yellow-500 transition-all duration-300"
+                              style={{ width: `${(trend.no_response / trend.total) * 100}%` }}
+                              title={`No Response: ${trend.no_response}`}
+                            ></div>
+                          )}
+                        </div>
+                      </div>
+                      <div className="text-xs text-gray-500 w-16 text-right">
+                        {trend.total} total
+                      </div>
+                    </div>
+                  ))}
+                </div>
+                <div className="flex gap-4 mt-4 text-xs text-gray-500">
+                  <div className="flex items-center gap-1">
+                    <div className="w-3 h-3 bg-green-500 rounded"></div>
+                    <span>Helpful</span>
+                  </div>
+                  <div className="flex items-center gap-1">
+                    <div className="w-3 h-3 bg-red-500 rounded"></div>
+                    <span>Not Helpful</span>
+                  </div>
+                  <div className="flex items-center gap-1">
+                    <div className="w-3 h-3 bg-yellow-500 rounded"></div>
+                    <span>No Response</span>
+                  </div>
+                </div>
+              </div>
+            )}
           </section>
         )}
       </main>

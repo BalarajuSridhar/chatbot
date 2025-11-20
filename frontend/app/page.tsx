@@ -1,4 +1,3 @@
-// app/page.tsx
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -9,7 +8,12 @@ const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
 type AskResponse = { answer: string };
 type STTResponse = { text: string };
 type MsgRole = "user" | "assistant" | "system";
-type Message = { id: string; role: MsgRole; text: string; feedback?: 'good' | 'bad' };
+type Message = { 
+  id: string; 
+  role: MsgRole; 
+  text: string; 
+  feedback?: 'good' | 'bad' | 'no_response'  // Updated to include 'no_response'
+};
 type LangCode = "en" | "te" | "ta" | "hi" | "mr" | "kn" | "ml" | "bn";
 
 // AI Model types
@@ -42,6 +46,11 @@ type SREvent = {
 type SRResult = {
   isFinal: boolean;
   0: { transcript: string };
+};
+
+// BlobEvent type for TypeScript
+type BlobEvent = Event & {
+  data: Blob;
 };
 
 // Available AI Models
@@ -257,7 +266,13 @@ export default function Page() {
   }
 
   // ---------- Feedback ----------
-  async function handleFeedback(messageId: string, feedback: 'good' | 'bad') {
+  async function handleFeedback(
+    messageId: string, 
+    feedback: 'good' | 'bad' | 'no_response', 
+    question?: string, 
+    answer?: string
+  ) {
+    // Update UI immediately
     setMessages(prev => prev.map(msg => 
       msg.id === messageId ? { ...msg, feedback } : msg
     ));
@@ -269,12 +284,22 @@ export default function Page() {
         body: JSON.stringify({ 
           message_id: messageId, 
           feedback,
+          question: question || messages.find(m => m.id === messageId)?.text,
+          answer: answer || messages.find(m => m.id === messageId && m.role === 'assistant')?.text,
           timestamp: new Date().toISOString()
         }),
       });
-      toast(`Feedback ${feedback === 'good' ? '👍' : '👎'} recorded`);
+      
+      const feedbackText = {
+        'good': '👍 Helpful',
+        'bad': '👎 Not Helpful', 
+        'no_response': '⏸️ No Response'
+      }[feedback];
+      
+      toast(`Feedback recorded: ${feedbackText}`);
     } catch (e) {
       console.error("Failed to send feedback:", e);
+      toast("Failed to record feedback");
     }
   }
 
@@ -920,9 +945,14 @@ export default function Page() {
                           {/* Feedback Buttons */}
                           <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity duration-300">
                             <div className="h-4 w-px bg-gray-300 mx-1 sm:mx-2"></div>
-                            <span className="text-xs text-gray-500 font-medium mr-2 hidden sm:inline">Helpful?</span>
+                            <span className="text-xs text-gray-500 font-medium mr-1 hidden sm:inline">Helpful?</span>
                             <button
-                              onClick={() => handleFeedback(m.id, 'good')}
+                              onClick={() => handleFeedback(
+                                m.id, 
+                                'good', 
+                                messages.find(msg => msg.role === 'user' && messages.indexOf(msg) < messages.indexOf(m))?.text,
+                                m.text
+                              )}
                               className={`p-1.5 sm:p-2 rounded-full transition-all duration-200 hover:scale-110 ${
                                 m.feedback === 'good' 
                                   ? 'bg-green-100 text-green-600 border border-green-200 shadow-sm' 
@@ -935,7 +965,12 @@ export default function Page() {
                               </svg>
                             </button>
                             <button
-                              onClick={() => handleFeedback(m.id, 'bad')}
+                              onClick={() => handleFeedback(
+                                m.id, 
+                                'bad', 
+                                messages.find(msg => msg.role === 'user' && messages.indexOf(msg) < messages.indexOf(m))?.text,
+                                m.text
+                              )}
                               className={`p-1.5 sm:p-2 rounded-full transition-all duration-200 hover:scale-110 ${
                                 m.feedback === 'bad' 
                                   ? 'bg-red-100 text-red-600 border border-red-200 shadow-sm' 
@@ -945,6 +980,24 @@ export default function Page() {
                             >
                               <svg className="w-3 h-3 sm:w-4 sm:h-4" fill="currentColor" viewBox="0 0 20 20">
                                 <path fillRule="evenodd" d="M5.293 7.293a1 1 0 011.414 0L10 10.586l3.293-3.293a1 1 0 111.414 1.414l-4 4a1 1 0 01-1.414 0l-4-4a1 1 0 010-1.414z" clipRule="evenodd" />
+                              </svg>
+                            </button>
+                            <button
+                              onClick={() => handleFeedback(
+                                m.id, 
+                                'no_response', 
+                                messages.find(msg => msg.role === 'user' && messages.indexOf(msg) < messages.indexOf(m))?.text,
+                                m.text
+                              )}
+                              className={`p-1.5 sm:p-2 rounded-full transition-all duration-200 hover:scale-110 ${
+                                m.feedback === 'no_response' 
+                                  ? 'bg-yellow-100 text-yellow-600 border border-yellow-200 shadow-sm' 
+                                  : 'bg-white text-gray-400 hover:text-yellow-500 hover:bg-yellow-50 border border-gray-200 hover:border-yellow-200'
+                              }`}
+                              title="No response needed"
+                            >
+                              <svg className="w-3 h-3 sm:w-4 sm:h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 9v6m4-6v6m7-3a9 9 0 11-18 0 9 9 0 0118 0z" />
                               </svg>
                             </button>
                           </div>

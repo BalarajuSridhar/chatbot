@@ -3,6 +3,8 @@ import os
 import io
 import uuid
 import logging
+from typing import Optional
+from pydantic import BaseModel
 from typing import List, Optional, Any
 from datetime import datetime, timedelta
 
@@ -36,6 +38,9 @@ try:
 except Exception:
     gTTS = None
 
+# HTTP client for Ollama
+import requests
+
 # JWT + password context
 import jwt
 from passlib.context import CryptContext
@@ -51,6 +56,10 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 CHROMA_DIR = os.getenv("CHROMA_DIR", os.path.join(BASE_DIR, "chroma"))
 EMBED_MODEL_NAME = os.getenv("EMBED_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2")
+
+# Ollama config (optional)
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3")
 
 # Fixed admin creds
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
@@ -79,6 +88,25 @@ app.add_middleware(
 )
 
 # ---------------------------------------------------------------------
+# Check Ollama availability (short, safe check)
+# ---------------------------------------------------------------------
+def _check_ollama_available(url: str) -> bool:
+    if not url:
+        return False
+    try:
+        health = f"{url.rstrip('/')}/api/models"
+        resp = requests.get(health, timeout=2)
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+OLLAMA_AVAILABLE = _check_ollama_available(OLLAMA_URL)
+if OLLAMA_AVAILABLE:
+    logger.info("Ollama detected at %s", OLLAMA_URL)
+else:
+    logger.info("Ollama not detected (will use OpenAI). Set OLLAMA_URL to enable)")
+
+# ---------------------------------------------------------------------
 # DB (SQLModel) for dataset metadata and logs
 # ---------------------------------------------------------------------
 DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{os.path.join(BASE_DIR, 'backend.db')}")
@@ -101,9 +129,54 @@ class LoggedQuestion(SQLModel, table=True):
     answer: Optional[str] = None
     dataset: Optional[str] = None
     language: Optional[str] = None
+    model_used: Optional[str] = None  # Track which model was used
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
+class FeedbackLog(SQLModel, table=True):
+    """
+    Stores user feedback for answers
+    """
+    id: Optional[int] = Field(default=None, primary_key=True)
+    message_id: str
+    feedback_type: str  # 'good', 'bad', 'no_response'
+    question: Optional[str] = None
+    answer: Optional[str] = None
+    dataset: Optional[str] = None
+    language: Optional[str] = None
+    model_used: Optional[str] = None  # Track which model was used
+    timestamp: str
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+# Create tables
 SQLModel.metadata.create_all(engine)
+
+# Manual table alteration for existing databases
+try:
+    with Session(engine) as session:
+        # Try to add model_used column to loggedquestion table if it doesn't exist
+        session.execute("""
+            PRAGMA table_info(loggedquestion)
+        """)
+        columns = [row[1] for row in session.execute("PRAGMA table_info(loggedquestion)")]
+        
+        if 'model_used' not in columns:
+            session.execute("ALTER TABLE loggedquestion ADD COLUMN model_used VARCHAR")
+            print("Added model_used column to loggedquestion table")
+        
+        # Try to add model_used column to feedbacklog table if it doesn't exist
+        session.execute("""
+            PRAGMA table_info(feedbacklog)
+        """)
+        columns = [row[1] for row in session.execute("PRAGMA table_info(feedbacklog)")]
+        
+        if 'model_used' not in columns:
+            session.execute("ALTER TABLE feedbacklog ADD COLUMN model_used VARCHAR")
+            print("Added model_used column to feedbacklog table")
+        
+        session.commit()
+        print("Database schema updated successfully")
+except Exception as e:
+    print(f"Database schema update completed or not needed: {e}")
 
 # ---------------------------------------------------------------------
 # Auth helpers (fixed credentials + JWT)
@@ -226,6 +299,69 @@ def build_prompt(question: str, contexts: List[str], lang_code: Optional[str]) -
     )
 
 # ---------------------------------------------------------------------
+# Ollama helper (minimal, tolerant parser)
+# ---------------------------------------------------------------------
+def ollama_generate(prompt: str, temperature: float = 0.2, max_tokens: int = 512) -> Optional[str]:
+    """
+    Call local Ollama HTTP API to generate text. Returns None on failure.
+    """
+    if not OLLAMA_AVAILABLE or not OLLAMA_URL:
+        return None
+    url = f"{OLLAMA_URL.rstrip('/')}/api/generate"
+    payload = {
+        "model": OLLAMA_MODEL,
+        "prompt": prompt,
+        "temperature": float(temperature),
+        "max_length": int(max_tokens),
+        "max_tokens": int(max_tokens),
+    }
+    try:
+        resp = requests.post(url, json=payload, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        # Try several possible shapes
+        if isinstance(data, dict) and "results" in data:
+            try:
+                res0 = data["results"][0]
+                content = res0.get("content")
+                if isinstance(content, list):
+                    for part in content:
+                        if isinstance(part, dict) and part.get("type") == "output_text":
+                            t = part.get("text")
+                            if t:
+                                return t.strip()
+                        if isinstance(part, dict):
+                            t = part.get("text") or part.get("output")
+                            if t:
+                                return str(t).strip()
+                # fallback in res0
+                for k in ("text", "output", "content"):
+                    v = res0.get(k)
+                    if isinstance(v, str) and v.strip():
+                        return v.strip()
+            except Exception:
+                pass
+        for k in ("output", "text", "completion", "response"):
+            if k in data and isinstance(data[k], str):
+                return data[k].strip()
+        if isinstance(data, dict) and "completions" in data:
+            comps = data["completions"]
+            if comps and isinstance(comps, list):
+                first = comps[0]
+                if isinstance(first, dict):
+                    for kk in ("text", "message", "data", "content"):
+                        v = first.get(kk)
+                        if isinstance(v, str) and v.strip():
+                            return v.strip()
+        return str(data)
+    except requests.RequestException as e:
+        logger.exception("Ollama request failed")
+        return None
+    except Exception as e:
+        logger.exception("Failed to parse Ollama response")
+        return None
+
+# ---------------------------------------------------------------------
 # Schemas
 # ---------------------------------------------------------------------
 class AskRequest(BaseModel):
@@ -233,6 +369,7 @@ class AskRequest(BaseModel):
     top_k: int = 4
     language: Optional[str] = None
     dataset: Optional[str] = None
+    model: Optional[str] = None  # Add model selection
 
 class IngestResponse(BaseModel):
     documents_added: int
@@ -241,9 +378,42 @@ class IngestResponse(BaseModel):
 class AskResponse(BaseModel):
     answer: str
 
+class FeedbackRequest(BaseModel):
+    message_id: str
+    feedback: str  # 'good', 'bad', 'no_response'
+    question: Optional[str] = None
+    answer: Optional[str] = None
+    timestamp: Optional[str] = None
+
 # ---------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------
+
+@app.get("/models")
+def get_available_models():
+    """Get available AI models"""
+    models = [
+        {
+            "id": "openai",
+            "name": f"OpenAI {OPENAI_MODEL}",
+            "provider": "OpenAI",
+            "description": "Cloud-based AI model with high accuracy",
+            "icon": "🔮",
+            "available": True
+        }
+    ]
+    
+    if OLLAMA_AVAILABLE:
+        models.append({
+            "id": "ollama",
+            "name": f"Ollama {OLLAMA_MODEL}",
+            "provider": "Ollama",
+            "description": "Local AI model for privacy and offline use",
+            "icon": "🦙",
+            "available": True
+        })
+    
+    return {"models": models}
 
 @app.post("/admin/login")
 async def admin_login(payload: dict = Body(...)):
@@ -295,6 +465,7 @@ def get_logged_questions(
                 "answer": r.answer,
                 "dataset": r.dataset,
                 "language": r.language,
+                "model_used": r.model_used,
                 "created_at": r.created_at.isoformat(),
             })
         return {"logs": out}
@@ -527,12 +698,22 @@ async def ask(req: AskRequest):
     if not q:
         raise HTTPException(status_code=400, detail="Question cannot be empty")
     
+    # Determine which model to use
+    use_ollama = False
+    model_name = req.model or "openai"
+    
+    if model_name and "ollama" in model_name.lower():
+        use_ollama = True
+        if not OLLAMA_AVAILABLE:
+            raise HTTPException(status_code=400, detail="Ollama is not available")
+    
     # Log the question immediately (we'll update with answer later)
     with Session(engine) as session:
         log_entry = LoggedQuestion(
             question=q,
             dataset=req.dataset,
-            language=req.language
+            language=req.language,
+            model_used=model_name  # Track model used
         )
         session.add(log_entry)
         session.commit()
@@ -594,19 +775,41 @@ async def ask(req: AskRequest):
 
     prompt = build_prompt(q, contexts, req.language)
     try:
-        completion = openai_client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.2,
-        )
-        # defensively read response
-        try:
-            answer = completion.choices[0].message.content.strip()
-        except Exception:
-            answer = getattr(completion, "text", "") or str(completion)
+        answer = None
+        
+        if use_ollama:
+            # Use Ollama
+            try:
+                system_text = "You are a helpful assistant."
+                final_prompt = f"{system_text}\n\n{prompt}"
+                answer = ollama_generate(final_prompt, temperature=0.2, max_tokens=1024)
+                if answer is None:
+                    raise RuntimeError("Ollama generation failed or returned no output")
+                logger.info(f"Generated answer using Ollama: {OLLAMA_MODEL}")
+            except Exception as e:
+                logger.warning(f"Ollama generation failed: {e}")
+                answer = f"Error: Ollama generation failed - {str(e)}"
+        else:
+            # Use OpenAI
+            try:
+                completion = openai_client.chat.completions.create(
+                    model=OPENAI_MODEL,
+                    messages=[
+                        {"role": "system", "content": "You are a helpful assistant."},
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0.2,
+                )
+                # defensively read response
+                try:
+                    answer = completion.choices[0].message.content.strip()
+                except Exception:
+                    answer = getattr(completion, "text", "") or str(completion)
+                logger.info(f"Generated answer using OpenAI: {OPENAI_MODEL}")
+            except Exception as e:
+                logger.warning(f"OpenAI generation failed: {e}")
+                answer = f"Error: OpenAI generation failed - {str(e)}"
+
     except Exception as e:
         logger.exception("LLM completion failed")
         answer = f"Error: Failed to generate answer - {str(e)}"
@@ -669,6 +872,9 @@ async def tts(request: Request):
     voice = None
     speed = 1.0  # Default speed (1.0 = normal)
 
+    # Quick toggle: set USE_OPENAI_TTS=false in .env to skip OpenAI calls entirely.
+    use_openai_tts = os.getenv("USE_OPENAI_TTS", "true").lower() in ("1", "true", "yes")
+
     if "application/json" in content_type:
         body = await request.json()
         text = body.get("text", "")
@@ -692,25 +898,28 @@ async def tts(request: Request):
     if not txt:
         raise HTTPException(status_code=400, detail="text required")
 
-    # Try OpenAI TTS (if your OpenAI client supports it)
-    try:
-        if hasattr(openai_client, "audio") and hasattr(openai_client.audio, "speech"):
-            # Use OpenAI TTS with speed control
-            out = openai_client.audio.speech.create(
-                model="tts-1",  # or "tts-1-hd" for higher quality
-                voice=voice or "alloy",
-                input=txt,
-                speed=speed  # Control speed here (0.25 to 4.0)
-            )
-            audio_bytes = getattr(out, "audio", None) or getattr(out, "data", None) or out
-            if isinstance(audio_bytes, (bytes, bytearray)):
-                return StreamingResponse(io.BytesIO(audio_bytes), media_type="audio/mpeg")
-    except RateLimitError as e:
-        logger.warning(f"OpenAI TTS quota exceeded, falling back to gTTS: {e}")
-        # Continue to gTTS fallback
-    except Exception as e:
-        logger.warning(f"OpenAI TTS failed, falling back to gTTS: {e}")
-        # Continue to gTTS fallback
+    # If OpenAI TTS is disabled by env, skip calling OpenAI entirely
+    if use_openai_tts:
+        try:
+            if hasattr(openai_client, "audio") and hasattr(openai_client.audio, "speech"):
+                # Use OpenAI TTS with speed control
+                out = openai_client.audio.speech.create(
+                    model="tts-1",  # or "tts-1-hd" for higher quality
+                    voice=voice or "alloy",
+                    input=txt,
+                    speed=speed  # Control speed here (0.25 to 4.0)
+                )
+                audio_bytes = getattr(out, "audio", None) or getattr(out, "data", None) or out
+                if isinstance(audio_bytes, (bytes, bytearray)):
+                    return StreamingResponse(io.BytesIO(audio_bytes), media_type="audio/mpeg")
+        except Exception as e:
+            # Inspect exception for quota/429-like error
+            logger.warning("OpenAI TTS call failed: %s", repr(e))
+            msg = str(e).lower()
+            if "quota" in msg or "insufficient_quota" in msg or "429" in msg or "too many requests" in msg:
+                logger.warning("OpenAI TTS quota/429 detected; falling back to gTTS")
+            else:
+                logger.info("OpenAI TTS failed; falling back to gTTS")
 
     # Fallback to gTTS - add support for new Indian languages
     if gTTS is None:
@@ -775,6 +984,137 @@ async def admin_upload(dataset: str = Form(...), files: List[UploadFile] = File(
 
     return {"ok": True, "dataset": dataset, "chunks_indexed": len(texts), "dataset_version": version}
 
+# ---------------------------------------------------------------------
+# Feedback Routes
+# ---------------------------------------------------------------------
+
+@app.post("/feedback")
+async def submit_feedback(feedback: FeedbackRequest):
+    """Store user feedback in the database"""
+    try:
+        timestamp = feedback.timestamp or datetime.utcnow().isoformat()
+        
+        # Insert into feedback table
+        with Session(engine) as session:
+            feedback_entry = FeedbackLog(
+                message_id=feedback.message_id,
+                feedback_type=feedback.feedback,
+                question=feedback.question,
+                answer=feedback.answer,
+                dataset=None,
+                language=None,
+                timestamp=timestamp
+            )
+            session.add(feedback_entry)
+            session.commit()
+        
+        return {"status": "success", "message": "Feedback recorded"}
+        
+    except Exception as e:
+        logger.exception("Failed to record feedback")
+        raise HTTPException(status_code=500, detail="Failed to record feedback")
+
+@app.get("/admin/feedback-logs")
+async def get_feedback_logs(
+    feedback_type: Optional[str] = Query(None, description="Filter by feedback type"),
+    limit: int = Query(100, gt=0, le=1000),
+    offset: int = Query(0, ge=0),
+    admin = Depends(get_current_admin)
+):
+    """Get feedback logs with filtering options"""
+    try:
+        with Session(engine) as session:
+            query = select(FeedbackLog)
+            
+            if feedback_type:
+                query = query.where(FeedbackLog.feedback_type == feedback_type)
+            
+            query = query.order_by(FeedbackLog.created_at.desc()).offset(offset).limit(limit)
+            feedback_logs = session.exec(query).all()
+            
+            logs = []
+            for log in feedback_logs:
+                logs.append({
+                    "id": log.id,
+                    "message_id": log.message_id,
+                    "feedback_type": log.feedback_type,
+                    "question": log.question,
+                    "answer": log.answer,
+                    "dataset": log.dataset,
+                    "language": log.language,
+                    "model_used": log.model_used,
+                    "timestamp": log.timestamp,
+                    "created_at": log.created_at.isoformat()
+                })
+            
+            # Get summary counts
+            total_query = select(FeedbackLog)
+            total_count = session.exec(total_query).all()
+            good_count = session.exec(total_query.where(FeedbackLog.feedback_type == "good")).all()
+            bad_count = session.exec(total_query.where(FeedbackLog.feedback_type == "bad")).all()
+            no_response_count = session.exec(total_query.where(FeedbackLog.feedback_type == "no_response")).all()
+            
+            summary = {
+                "total": len(total_count),
+                "good": len(good_count),
+                "bad": len(bad_count),
+                "no_response": len(no_response_count)
+            }
+            
+            return {
+                "feedback_logs": logs,
+                "summary": summary,
+                "pagination": {
+                    "limit": limit,
+                    "offset": offset,
+                    "total": len(total_count)
+                }
+            }
+            
+    except Exception as e:
+        logger.exception("Failed to fetch feedback logs")
+        raise HTTPException(status_code=500, detail="Failed to fetch feedback logs")
+
+@app.get("/admin/feedback-stats")
+async def get_feedback_stats(
+    days: Optional[int] = Query(30, description="Number of days to analyze"),
+    admin = Depends(get_current_admin)
+):
+    """Get feedback statistics and trends"""
+    try:
+        since_date = datetime.utcnow() - timedelta(days=days)
+        
+        with Session(engine) as session:
+            # Get daily counts
+            daily_query = session.exec(
+                select(FeedbackLog).where(FeedbackLog.created_at >= since_date)
+            ).all()
+            
+            # Group by date and feedback type
+            daily_stats = {}
+            for log in daily_query:
+                date_str = log.created_at.date().isoformat()
+                if date_str not in daily_stats:
+                    daily_stats[date_str] = {"good": 0, "bad": 0, "no_response": 0, "total": 0}
+                
+                daily_stats[date_str][log.feedback_type] += 1
+                daily_stats[date_str]["total"] += 1
+            
+            # Convert to list for frontend
+            daily_trends = [
+                {"date": date, **counts} 
+                for date, counts in daily_stats.items()
+            ]
+            daily_trends.sort(key=lambda x: x["date"])
+            
+            return {
+                "daily_trends": daily_trends,
+                "period_days": days
+            }
+            
+    except Exception as e:
+        logger.exception("Failed to fetch feedback stats")
+        raise HTTPException(status_code=500, detail="Failed to fetch feedback stats")
 
 @app.get("/health")
 def health():
