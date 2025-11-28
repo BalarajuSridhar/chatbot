@@ -145,6 +145,34 @@ export default function Page() {
   // Calculate API host once at component level
   const apiHost = useMemo(() => getApiHost(), []);
 
+    // Backend health check
+  useEffect(() => {
+    const checkBackend = async () => {
+      try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 5000);
+        
+        const res = await fetch(`${API_BASE}/health`, { 
+          signal: controller.signal 
+        });
+        
+        clearTimeout(timeoutId);
+        
+        if (res.ok) {
+          setBackendStatus('online');
+        } else {
+          setBackendStatus('offline');
+        }
+      } catch {
+        setBackendStatus('offline');
+      }
+    };
+
+    checkBackend();
+    const interval = setInterval(checkBackend, 60000); // Check every minute
+    return () => clearInterval(interval);
+  }, []);
+  
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, asking]);
@@ -1361,4 +1389,8 @@ function errorMessage(e: unknown): string | undefined {
     if (typeof m === "string") return m;
   }
   return undefined;
+}
+
+function setBackendStatus(arg0: string) {
+  throw new Error("Function not implemented.");
 }
