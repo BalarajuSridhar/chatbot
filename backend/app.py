@@ -406,8 +406,8 @@ async def root():
     return {"message": "MSME PDF Q&A API", "status": "healthy", "free_tier": "active"}
 
 @app.get("/health")
-def health():
-    return {"status": "ok", "provider": "openai", "free_tier": True}
+async def health_check():
+    return {"status": "ok", "service": "msme-backend" ,"provider": "openai", "free_tier": True}
 
 @app.get("/models")
 def get_available_models():
@@ -1173,4 +1173,5 @@ async def get_feedback_stats(
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("app:app", host="0.0.0.0", port=port, access_log=False)
