@@ -193,16 +193,24 @@ def get_current_admin(token: str = Depends(oauth2_scheme)):
     return type("AdminObj", (), {"username": username})
 
 # ---------------------------------------------------------------------
-# OpenAI client, embedder, Chroma
+# OpenAI client, embedder (lazy), Chroma
 # ---------------------------------------------------------------------
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
-try:
-    _embedder = SentenceTransformer(EMBED_MODEL_NAME)
-    logger.info(f"Loaded embedding model: {EMBED_MODEL_NAME}")
-except Exception as e:
-    logger.exception("Failed to load embedder")
-    raise
+# Lazy-load the embedder so startup is fast on Render
+_embedder: Optional[SentenceTransformer] = None
+
+def get_embedder() -> SentenceTransformer:
+    global _embedder
+    if _embedder is None:
+        try:
+            logger.info(f"Loading embedding model: {EMBED_MODEL_NAME}")
+            _embedder = SentenceTransformer(EMBED_MODEL_NAME)
+            logger.info(f"Loaded embedding model: {EMBED_MODEL_NAME}")
+        except Exception as e:
+            logger.exception("Failed to load embedder")
+            raise
+    return _embedder
 
 try:
     chroma_client = chromadb.PersistentClient(
@@ -218,7 +226,8 @@ except Exception as e:
 def embed_texts(texts: List[str]) -> List[List[float]]:
     if not texts:
         return []
-    embs = _embedder.encode(texts, normalize_embeddings=True)
+    embedder = get_embedder()
+    embs = embedder.encode(texts, normalize_embeddings=True)
     return embs.tolist() if isinstance(embs, np.ndarray) else embs
 
 # ---------------------------------------------------------------------
@@ -1000,4 +1009,3 @@ async def get_feedback_stats(
     except Exception as e:
         logger.exception("Failed to fetch feedback stats")
         raise HTTPException(status_code=500, detail="Failed to fetch feedback stats")
-
