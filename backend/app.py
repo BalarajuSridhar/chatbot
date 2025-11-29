@@ -1001,7 +1001,3 @@ async def get_feedback_stats(
         logger.exception("Failed to fetch feedback stats")
         raise HTTPException(status_code=500, detail="Failed to fetch feedback stats")
 
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("app:app", host="0.0.0.0", port=port, access_log=False)
