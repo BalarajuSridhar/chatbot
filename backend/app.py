@@ -1,9 +1,12 @@
-# backend/app.py - Optimized for Render + Vercel Deployment
+# backend/app.py
 import os
 import io
 import uuid
 import logging
-from typing import Optional, List, Any
+import shutil
+from typing import Optional
+from pydantic import BaseModel
+from typing import List, Optional, Any
 from datetime import datetime, timedelta
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Depends, Body, Request, Query
@@ -36,60 +39,39 @@ try:
 except Exception:
     gTTS = None
 
+# HTTP client for Ollama
+import requests
+
 # JWT + password context
 import jwt
 from passlib.context import CryptContext
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 
 # ---------------------------------------------------------------------
-# Free Tier Optimizations for Render
-# ---------------------------------------------------------------------
-
-# Render-specific optimizations
-if "RENDER" in os.environ:
-    # Use Render's persistent disk for ChromaDB
-    CHROMA_DIR = "/opt/render/project/src/chroma_data"
-    os.makedirs(CHROMA_DIR, exist_ok=True)
-    
-    # Reduce memory usage
-    os.environ["TOKENIZERS_PARALLELISM"] = "false"
-    
-    # Use smaller model for free tier
-    EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
-    
-    # Free tier limits
-    MAX_FILE_SIZE = 5 * 1024 * 1024  # 5MB
-    MAX_CHUNKS_PER_FILE = 200
-    MAX_FILES_PER_UPLOAD = 2
-else:
-    # Local development settings
-    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-    CHROMA_DIR = os.path.join(BASE_DIR, "chroma")
-    EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
-    MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB locally
-    MAX_CHUNKS_PER_FILE = 500
-    MAX_FILES_PER_UPLOAD = 5
-
-# ---------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------
-if not "RENDER" in os.environ:
-    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-    load_dotenv(os.path.join(BASE_DIR, ".env"))
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(BASE_DIR, ".env"))
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+CHROMA_DIR = os.getenv("CHROMA_DIR", os.path.join(BASE_DIR, "chroma"))
+EMBED_MODEL_NAME = os.getenv("EMBED_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2")
+
+# Ollama config (optional)
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3")
 
 # Fixed admin creds
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "changeme")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "changeme")  # plaintext in env for dev
 
-JWT_SECRET = os.getenv("JWT_SECRET", "please_change_me_very_secure_key_here")
+JWT_SECRET = os.getenv("JWT_SECRET", "please_change_me")
 JWT_ALGO = "HS256"
 JWT_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "1440"))
 
 if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY required in environment variables")
+    raise RuntimeError("OPENAI_API_KEY required in backend/.env")
 
 # ---------------------------------------------------------------------
 # Logging & app
@@ -97,39 +79,38 @@ if not OPENAI_API_KEY:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("backend.app")
 
-app = FastAPI(title="MSME PDF Q&A Chatbot")
+app = FastAPI(title="PDF Q&A Chatbot (single-file backend)")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],     # tighten in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # ---------------------------------------------------------------------
-# Free Tier Middleware
+# Check Ollama availability (short, safe check)
 # ---------------------------------------------------------------------
-@app.middleware("http")
-async def free_tier_limits(request: Request, call_next):
-    # File size limits for free tier
-    content_length = request.headers.get("content-length")
-    if content_length and int(content_length) > MAX_FILE_SIZE:
-        return JSONResponse(
-            status_code=413,
-            content={"detail": f"File size limited to {MAX_FILE_SIZE//1024//1024}MB on free tier"}
-        )
-    
-    response = await call_next(request)
-    return response
+def _check_ollama_available(url: str) -> bool:
+    if not url:
+        return False
+    try:
+        health = f"{url.rstrip('/')}/api/tags"
+        resp = requests.get(health, timeout=2)
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+OLLAMA_AVAILABLE = _check_ollama_available(OLLAMA_URL)
+if OLLAMA_AVAILABLE:
+    logger.info("Ollama detected at %s", OLLAMA_URL)
+else:
+    logger.info("Ollama not detected (will use OpenAI). Set OLLAMA_URL to enable)")
 
 # ---------------------------------------------------------------------
 # DB (SQLModel) for dataset metadata and logs
 # ---------------------------------------------------------------------
-if "RENDER" in os.environ:
-    DATABASE_URL = f"sqlite:///{os.path.join('/opt/render/project/src', 'backend.db')}"
-else:
-    DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{os.path.join(BASE_DIR, 'backend.db')}")
-
+DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{os.path.join(BASE_DIR, 'backend.db')}")
 engine = create_engine(DATABASE_URL, echo=False)
 
 class DatasetMeta(SQLModel, table=True):
@@ -141,31 +122,65 @@ class DatasetMeta(SQLModel, table=True):
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
 class LoggedQuestion(SQLModel, table=True):
+    """
+    Stores each user question + assistant answer for admin viewing.
+    """
     id: Optional[int] = Field(default=None, primary_key=True)
     question: str
     answer: Optional[str] = None
     dataset: Optional[str] = None
     language: Optional[str] = None
-    model_used: Optional[str] = None
+    model_used: Optional[str] = None  # Track which model was used
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
 class FeedbackLog(SQLModel, table=True):
+    """
+    Stores user feedback for answers
+    """
     id: Optional[int] = Field(default=None, primary_key=True)
     message_id: str
-    feedback_type: str
+    feedback_type: str  # 'good', 'bad', 'no_response'
     question: Optional[str] = None
     answer: Optional[str] = None
     dataset: Optional[str] = None
     language: Optional[str] = None
-    model_used: Optional[str] = None
+    model_used: Optional[str] = None  # Track which model was used
     timestamp: str
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
 # Create tables
 SQLModel.metadata.create_all(engine)
 
+# Manual table alteration for existing databases
+try:
+    with Session(engine) as session:
+        # Try to add model_used column to loggedquestion table if it doesn't exist
+        session.execute("""
+            PRAGMA table_info(loggedquestion)
+        """)
+        columns = [row[1] for row in session.execute("PRAGMA table_info(loggedquestion)")]
+        
+        if 'model_used' not in columns:
+            session.execute("ALTER TABLE loggedquestion ADD COLUMN model_used VARCHAR")
+            print("Added model_used column to loggedquestion table")
+        
+        # Try to add model_used column to feedbacklog table if it doesn't exist
+        session.execute("""
+            PRAGMA table_info(feedbacklog)
+        """)
+        columns = [row[1] for row in session.execute("PRAGMA table_info(feedbacklog)")]
+        
+        if 'model_used' not in columns:
+            session.execute("ALTER TABLE feedbacklog ADD COLUMN model_used VARCHAR")
+            print("Added model_used column to feedbacklog table")
+        
+        session.commit()
+        print("Database schema updated successfully")
+except Exception as e:
+    print(f"Database schema update completed or not needed: {e}")
+
 # ---------------------------------------------------------------------
-# Auth helpers
+# Auth helpers (fixed credentials + JWT)
 # ---------------------------------------------------------------------
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/admin/token")
@@ -193,42 +208,70 @@ def get_current_admin(token: str = Depends(oauth2_scheme)):
     return type("AdminObj", (), {"username": username})
 
 # ---------------------------------------------------------------------
-# OpenAI client, embedder (lazy), Chroma
+# OpenAI client, embedder, Chroma - WITH ERROR HANDLING
 # ---------------------------------------------------------------------
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
-# Lazy-load the embedder so startup is fast on Render
-_embedder: Optional[SentenceTransformer] = None
+try:
+    _embedder = SentenceTransformer(EMBED_MODEL_NAME)
+    logger.info(f"Embedder loaded: {EMBED_MODEL_NAME}")
+except Exception as e:
+    logger.exception("Failed to load embedder")
+    raise
 
-def get_embedder() -> SentenceTransformer:
-    global _embedder
-    if _embedder is None:
+# Improved ChromaDB initialization with error handling
+def initialize_chromadb():
+    global chroma_client, collection
+    
+    # Clean up corrupted database if exists
+    if os.path.exists(CHROMA_DIR):
         try:
-            logger.info(f"Loading embedding model: {EMBED_MODEL_NAME}")
-            _embedder = SentenceTransformer(EMBED_MODEL_NAME)
-            logger.info(f"Loaded embedding model: {EMBED_MODEL_NAME}")
+            # Test if database is healthy
+            test_client = chromadb.PersistentClient(path=CHROMA_DIR)
+            test_client.heartbeat()
+            test_client.list_collections()
+            chroma_client = test_client
+            logger.info("Existing ChromaDB database is healthy")
         except Exception as e:
-            logger.exception("Failed to load embedder")
-            raise
-    return _embedder
+            logger.warning(f"Existing ChromaDB database may be corrupted: {e}")
+            logger.info("Recreating ChromaDB database...")
+            shutil.rmtree(CHROMA_DIR)
+            chroma_client = chromadb.PersistentClient(path=CHROMA_DIR)
+    else:
+        chroma_client = chromadb.PersistentClient(path=CHROMA_DIR)
+    
+    # Get or create collection
+    try:
+        collection = chroma_client.get_or_create_collection(
+            name="pdf_docs",
+            metadata={"hnsw:space": "cosine"}
+        )
+        logger.info("ChromaDB collection initialized successfully")
+    except Exception as e:
+        logger.exception("Failed to initialize ChromaDB collection")
+        raise
 
 try:
-    chroma_client = chromadb.PersistentClient(
-        path=CHROMA_DIR,
-        settings=Settings(anonymized_telemetry=False)
-    )
-    collection = chroma_client.get_or_create_collection("pdf_docs")
-    logger.info(f"ChromaDB initialized at: {CHROMA_DIR}")
+    initialize_chromadb()
 except Exception as e:
-    logger.exception("Failed to init Chroma")
-    raise
+    logger.exception("ChromaDB initialization failed, trying in-memory client as fallback")
+    try:
+        chroma_client = chromadb.EphemeralClient()
+        collection = chroma_client.get_or_create_collection("pdf_docs")
+        logger.info("Using in-memory ChromaDB client as fallback")
+    except Exception as e:
+        logger.exception("All ChromaDB clients failed")
+        raise
 
 def embed_texts(texts: List[str]) -> List[List[float]]:
     if not texts:
         return []
-    embedder = get_embedder()
-    embs = embedder.encode(texts, normalize_embeddings=True)
-    return embs.tolist() if isinstance(embs, np.ndarray) else embs
+    try:
+        embs = _embedder.encode(texts, normalize_embeddings=True)
+        return embs.tolist() if isinstance(embs, np.ndarray) else embs
+    except Exception as e:
+        logger.exception("Failed to embed texts")
+        raise
 
 # ---------------------------------------------------------------------
 # Helpers: PDF read, OCR, chunking, prompt builder
@@ -236,29 +279,40 @@ def embed_texts(texts: List[str]) -> List[List[float]]:
 def read_pdf(file_bytes: bytes) -> str:
     try:
         reader = PdfReader(io.BytesIO(file_bytes))
-    except Exception:
+    except Exception as e:
+        logger.warning(f"Failed to read PDF: {e}")
         return ""
     out: List[str] = []
     for page in reader.pages:
         try:
-            out.append(page.extract_text() or "")
-        except Exception:
+            text = page.extract_text()
+            if text and text.strip():
+                out.append(text.strip())
+        except Exception as e:
+            logger.warning(f"Failed to extract text from PDF page: {e}")
             continue
     return "\n".join(out)
 
 def run_ocr_on_pdf(file_bytes: bytes) -> str:
     if pytesseract is None or convert_from_bytes is None:
-        raise RuntimeError("OCR not available")
+        raise RuntimeError("OCR dependencies not available")
     parts: List[str] = []
-    images = convert_from_bytes(file_bytes, fmt="jpeg")
-    for image in images:
-        try:
-            parts.append(pytesseract.image_to_string(image))
-        except Exception:
-            continue
-    return "\n".join(parts)
+    try:
+        images = convert_from_bytes(file_bytes, fmt="jpeg", dpi=200)
+        for image in images:
+            try:
+                text = pytesseract.image_to_string(image)
+                if text and text.strip():
+                    parts.append(text.strip())
+            except Exception as e:
+                logger.warning(f"OCR failed for image: {e}")
+                continue
+        return "\n".join(parts)
+    except Exception as e:
+        logger.exception("OCR processing failed")
+        raise
 
-def chunk_text(text: str, chunk_size: int = 800, overlap: int = 100) -> List[str]:  # Smaller chunks for free tier
+def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 150) -> List[str]:
     text = " ".join((text or "").split()).strip()
     if not text:
         return []
@@ -299,6 +353,54 @@ def build_prompt(question: str, contexts: List[str], lang_code: Optional[str]) -
     )
 
 # ---------------------------------------------------------------------
+# Ollama helper (improved with better error handling)
+# ---------------------------------------------------------------------
+def ollama_generate(prompt: str, temperature: float = 0.2, max_tokens: int = 512) -> Optional[str]:
+    """
+    Call local Ollama HTTP API to generate text. Returns None on failure.
+    """
+    if not OLLAMA_AVAILABLE or not OLLAMA_URL:
+        return None
+    
+    url = f"{OLLAMA_URL.rstrip('/')}/api/generate"
+    payload = {
+        "model": OLLAMA_MODEL,
+        "prompt": prompt,
+        "stream": False,
+        "options": {
+            "temperature": float(temperature),
+            "num_predict": int(max_tokens),
+        }
+    }
+    
+    try:
+        resp = requests.post(url, json=payload, timeout=60)
+        resp.raise_for_status()
+        data = resp.json()
+        
+        # Handle Ollama response format
+        if isinstance(data, dict):
+            # Try different response formats
+            if "response" in data:
+                return data["response"].strip()
+            elif "text" in data:
+                return data["text"].strip()
+            elif "content" in data:
+                return data["content"].strip()
+            elif "message" in data and "content" in data["message"]:
+                return data["message"]["content"].strip()
+        
+        logger.warning(f"Unexpected Ollama response format: {data}")
+        return None
+        
+    except requests.RequestException as e:
+        logger.error(f"Ollama request failed: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Failed to parse Ollama response: {e}")
+        return None
+
+# ---------------------------------------------------------------------
 # Schemas
 # ---------------------------------------------------------------------
 class AskRequest(BaseModel):
@@ -317,7 +419,7 @@ class AskResponse(BaseModel):
 
 class FeedbackRequest(BaseModel):
     message_id: str
-    feedback: str
+    feedback: str  # 'good', 'bad', 'no_response'
     question: Optional[str] = None
     answer: Optional[str] = None
     timestamp: Optional[str] = None
@@ -325,16 +427,14 @@ class FeedbackRequest(BaseModel):
 # ---------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------
+
 @app.get("/")
 async def root():
-    return {"message": "MSME PDF Q&A API", "status": "healthy", "free_tier": "active"}
-
-@app.get("/health")
-async def health_check():
-    return {"status": "ok", "service": "msme-backend" ,"provider": "openai", "free_tier": True}
+    return {"message": "PDF Q&A Chatbot API", "status": "healthy"}
 
 @app.get("/models")
 def get_available_models():
+    """Get available AI models"""
     models = [
         {
             "id": "openai",
@@ -345,10 +445,26 @@ def get_available_models():
             "available": True
         }
     ]
+    
+    if OLLAMA_AVAILABLE:
+        models.append({
+            "id": "ollama",
+            "name": f"Ollama {OLLAMA_MODEL}",
+            "provider": "Ollama",
+            "description": "Local AI model for privacy and offline use",
+            "icon": "🦙",
+            "available": True
+        })
+    
     return {"models": models}
 
 @app.post("/admin/login")
 async def admin_login(payload: dict = Body(...)):
+    """
+    Simple JSON login for frontend convenience.
+    POST { "username": "...", "password": "..." }
+    Returns { access_token, token_type } on success.
+    """
     username = payload.get("username")
     password = payload.get("password")
     if username != ADMIN_USERNAME or password != ADMIN_PASSWORD:
@@ -369,6 +485,11 @@ def get_logged_questions(
     since: Optional[str] = Query(None),
     admin = Depends(get_current_admin)
 ):
+    """
+    Return recent logged questions. Query params:
+    - limit: max number of rows (default 200, max 1000)
+    - since: ISO datetime string to filter from (inclusive)
+    """
     with Session(engine) as session:
         q = select(LoggedQuestion).order_by(LoggedQuestion.created_at.desc())
         if since:
@@ -396,21 +517,27 @@ async def list_uploaded_files(
     dataset: Optional[str] = Query(None, description="Filter by dataset"),
     admin = Depends(get_current_admin)
 ):
+    """
+    List all uploaded PDF files with their chunk counts.
+    """
     try:
+        # Get all documents
         try:
             if dataset:
                 results = collection.get(where={"dataset": dataset})
             else:
                 results = collection.get()
-        except TypeError:
+        except Exception:
+            # Fallback for different ChromaDB versions
             if dataset:
-                results = collection.get(filter={"dataset": dataset})
+                results = collection.get(where={"dataset": dataset})
             else:
                 results = collection.get()
         
         if not results or not results.get("metadatas"):
             return {"files": []}
         
+        # Count files and chunks
         file_stats = {}
         metadatas = results["metadatas"]
         
@@ -444,25 +571,31 @@ async def delete_file_by_filename(
     dataset: Optional[str] = Query(None, description="Specific dataset to search in"),
     admin = Depends(get_current_admin)
 ):
+    """
+    Delete all chunks from a specific PDF file.
+    """
     try:
+        # Build filter for ChromaDB
         where_filter = {"filename": filename}
         if dataset:
             where_filter["dataset"] = dataset
         
+        # Get the documents first to count them
         try:
             results = collection.get(where=where_filter)
-        except TypeError:
-            results = collection.get(filter=where_filter)
+        except Exception:
+            results = collection.get(where=where_filter)
         
         if not results or not results.get("ids"):
             raise HTTPException(status_code=404, detail=f"No documents found for filename: {filename}")
         
         document_count = len(results["ids"])
         
+        # Delete from ChromaDB
         try:
             collection.delete(where=where_filter)
-        except TypeError:
-            collection.delete(filter=where_filter)
+        except Exception:
+            collection.delete(where=where_filter)
         
         logger.info(f"Deleted {document_count} chunks from file: {filename}")
         
@@ -484,11 +617,15 @@ async def delete_entire_dataset(
     dataset: str = Query(..., description="Name of the dataset to delete entirely"),
     admin = Depends(get_current_admin)
 ):
+    """
+    Delete all documents from a specific dataset.
+    """
     try:
+        # Get the documents first to count them
         try:
             results = collection.get(where={"dataset": dataset})
-        except TypeError:
-            results = collection.get(filter={"dataset": dataset})
+        except Exception:
+            results = collection.get(where={"dataset": dataset})
         
         if not results or not results.get("ids"):
             raise HTTPException(status_code=404, detail=f"No documents found for dataset: {dataset}")
@@ -500,11 +637,13 @@ async def delete_entire_dataset(
                 if isinstance(metadata, dict) and "filename" in metadata:
                     filenames.add(metadata["filename"])
         
+        # Delete from ChromaDB
         try:
             collection.delete(where={"dataset": dataset})
-        except TypeError:
-            collection.delete(filter={"dataset": dataset})
+        except Exception:
+            collection.delete(where={"dataset": dataset})
         
+        # Also remove from DatasetMeta table
         with Session(engine) as session:
             datasets = session.exec(select(DatasetMeta).where(DatasetMeta.name == dataset)).all()
             for ds in datasets:
@@ -531,11 +670,11 @@ def list_datasets():
     try:
         try:
             results = collection.get(include=["metadatas"], limit=10000)
-        except TypeError:
+        except Exception:
             results = collection.get()
         metadatas_any = results.get("metadatas") if isinstance(results, dict) else None
         if metadatas_any is None:
-            metadatas_any = getattr(collection, "metadatas", []) or []
+            metadatas_any = []
         datasets = set()
         flat_meta_entries: List[Any] = []
         if isinstance(metadatas_any, list):
@@ -560,11 +699,11 @@ def list_datasets():
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/ingest", response_model=IngestResponse)
-async def ingest(files: List[UploadFile] = File(...), dataset: Optional[str] = Form(None), ocr: Optional[bool] = Form(False)):
-    # Free tier: limit files
-    if len(files) > MAX_FILES_PER_UPLOAD:
-        raise HTTPException(status_code=400, detail=f"Free tier limited to {MAX_FILES_PER_UPLOAD} files at once")
-    
+async def ingest(
+    files: List[UploadFile] = File(...), 
+    dataset: Optional[str] = Form(None), 
+    ocr: Optional[bool] = Form(False)
+):
     texts: List[str] = []
     metadatas: List[dict] = []
     ids: List[str] = []
@@ -573,11 +712,7 @@ async def ingest(files: List[UploadFile] = File(...), dataset: Optional[str] = F
         if not f.filename.lower().endswith(".pdf"):
             raise HTTPException(status_code=400, detail=f"Only PDF supported: {f.filename}")
         
-        # Check file size
         data = await f.read()
-        if len(data) > MAX_FILE_SIZE:
-            raise HTTPException(status_code=400, detail=f"File {f.filename} exceeds {MAX_FILE_SIZE//1024//1024}MB limit")
-        
         content = read_pdf(data)
         used_ocr = False
         
@@ -585,22 +720,20 @@ async def ingest(files: List[UploadFile] = File(...), dataset: Optional[str] = F
             try:
                 content = run_ocr_on_pdf(data)
                 used_ocr = True
+                logger.info(f"Used OCR for file: {f.filename}")
             except Exception as e:
                 logger.warning("OCR failed for %s: %s", f.filename, e)
                 content = ""
         
         if not content.strip():
+            logger.warning(f"No extractable text found in: {f.filename}")
             continue
-            
-        chunks = chunk_text(content)
         
-        # Limit chunks for free tier
-        if len(chunks) > MAX_CHUNKS_PER_FILE:
-            chunks = chunks[:MAX_CHUNKS_PER_FILE]
-            
+        chunks = chunk_text(content)
         if not chunks:
+            logger.warning(f"No chunks created from: {f.filename}")
             continue
-            
+        
         texts.extend(chunks)
         meta = {"filename": f.filename, "ocr": used_ocr}
         if dataset:
@@ -611,14 +744,13 @@ async def ingest(files: List[UploadFile] = File(...), dataset: Optional[str] = F
     if not texts:
         raise HTTPException(status_code=400, detail="No extractable text found in PDFs")
     
-    # Limit total chunks for free tier
-    if len(texts) > 500:
-        texts = texts[:500]
-        metadatas = metadatas[:500]
-        ids = ids[:500]
-    
-    vectors = embed_texts(texts)
-    collection.add(documents=texts, embeddings=vectors, metadatas=metadatas, ids=ids)
+    try:
+        vectors = embed_texts(texts)
+        collection.add(documents=texts, embeddings=vectors, metadatas=metadatas, ids=ids)
+        logger.info(f"Added {len(texts)} chunks from {len(set(m['filename'] for m in metadatas))} files")
+    except Exception as e:
+        logger.exception("Failed to add documents to ChromaDB")
+        raise HTTPException(status_code=500, detail=f"Failed to index documents: {str(e)}")
     
     return IngestResponse(
         documents_added=len(set(m["filename"] for m in metadatas)), 
@@ -631,9 +763,16 @@ async def ask(req: AskRequest):
     if not q:
         raise HTTPException(status_code=400, detail="Question cannot be empty")
     
-    # Keep model_name only for logging; we always use OpenAI now
+    # Determine which model to use
+    use_ollama = False
     model_name = req.model or "openai"
     
+    if model_name and "ollama" in model_name.lower():
+        use_ollama = True
+        if not OLLAMA_AVAILABLE:
+            raise HTTPException(status_code=400, detail="Ollama is not available")
+    
+    # Log the question immediately (we'll update with answer later)
     with Session(engine) as session:
         log_entry = LoggedQuestion(
             question=q,
@@ -645,26 +784,34 @@ async def ask(req: AskRequest):
         session.commit()
         log_id = log_entry.id
     
-    qvecs = embed_texts([q])
-    if not qvecs:
+    # Embed the question
+    try:
+        qvecs = embed_texts([q])
+        if not qvecs:
+            raise Exception("Empty embedding result")
+        qvec = qvecs[0]
+    except Exception as e:
+        logger.exception("Failed to embed query")
         with Session(engine) as session:
             log_entry = session.get(LoggedQuestion, log_id)
             if log_entry:
                 log_entry.answer = "Error: Failed to embed query"
                 session.commit()
-        raise HTTPException(status_code=500, detail="Failed to embed query")
+        raise HTTPException(status_code=500, detail="Failed to process query")
     
-    qvec = qvecs[0]
+    # Query ChromaDB
     try:
         if req.dataset:
-            results = collection.query(query_embeddings=[qvec], n_results=max(1, req.top_k), where={"dataset": req.dataset})
+            results = collection.query(
+                query_embeddings=[qvec], 
+                n_results=max(1, req.top_k), 
+                where={"dataset": req.dataset}
+            )
         else:
-            results = collection.query(query_embeddings=[qvec], n_results=max(1, req.top_k))
-    except TypeError:
-        if req.dataset:
-            results = collection.query(query_embeddings=[qvec], n_results=max(1, req.top_k), filter={"dataset": req.dataset})
-        else:
-            results = collection.query(query_embeddings=[qvec], n_results=max(1, req.top_k))
+            results = collection.query(
+                query_embeddings=[qvec], 
+                n_results=max(1, req.top_k)
+            )
     except Exception as e:
         logger.exception("Vector DB query failed")
         with Session(engine) as session:
@@ -674,21 +821,18 @@ async def ask(req: AskRequest):
                 session.commit()
         raise HTTPException(status_code=500, detail=str(e))
 
+    # Extract contexts
     contexts: List[str] = []
     try:
         docs = results.get("documents", [[]])
         if isinstance(docs, list) and len(docs) > 0:
             contexts = docs[0] if isinstance(docs[0], list) else list(docs)
-    except Exception:
-        try:
-            raw_docs = results.get("documents")
-            if isinstance(raw_docs, list):
-                contexts = [d for d in raw_docs if isinstance(d, str)]
-        except Exception:
-            contexts = []
+    except Exception as e:
+        logger.warning("Failed to extract documents from results: %s", e)
+        contexts = []
 
     if not contexts:
-        answer_text = "I couldn't find relevant content in the indexed PDFs."
+        answer_text = "I couldn't find relevant content in the indexed PDFs to answer your question."
         with Session(engine) as session:
             log_entry = session.get(LoggedQuestion, log_id)
             if log_entry:
@@ -696,31 +840,50 @@ async def ask(req: AskRequest):
                 session.commit()
         return AskResponse(answer=answer_text)
 
+    # Generate answer
     prompt = build_prompt(q, contexts, req.language)
+    answer = None
+    
     try:
-        try:
-            completion = openai_client.chat.completions.create(
-                model=OPENAI_MODEL,
-                messages=[
-                    {"role": "system", "content": "You are a helpful assistant."},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.2,
-            )
-            answer = completion.choices[0].message.content.strip()
-            logger.info(f"Generated answer using OpenAI: {OPENAI_MODEL}")
-        except Exception as e:
-            logger.warning(f"OpenAI generation failed: {e}")
-            answer = f"Error: OpenAI generation failed - {str(e)}"
+        if use_ollama:
+            # Use Ollama
+            try:
+                system_text = "You are a helpful assistant that answers questions based on the provided context."
+                final_prompt = f"{system_text}\n\n{prompt}"
+                answer = ollama_generate(final_prompt, temperature=0.2, max_tokens=1024)
+                if answer is None:
+                    raise RuntimeError("Ollama generation failed or returned no output")
+                logger.info(f"Generated answer using Ollama: {OLLAMA_MODEL}")
+            except Exception as e:
+                logger.warning(f"Ollama generation failed: {e}")
+                answer = f"I apologize, but I encountered an error while generating the answer. Please try again."
+        else:
+            # Use OpenAI
+            try:
+                completion = openai_client.chat.completions.create(
+                    model=OPENAI_MODEL,
+                    messages=[
+                        {"role": "system", "content": "You are a helpful assistant that answers questions based on the provided context."},
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0.2,
+                    max_tokens=1024
+                )
+                answer = completion.choices[0].message.content.strip()
+                logger.info(f"Generated answer using OpenAI: {OPENAI_MODEL}")
+            except Exception as e:
+                logger.warning(f"OpenAI generation failed: {e}")
+                answer = f"I apologize, but I encountered an error while generating the answer. Please try again."
+
     except Exception as e:
         logger.exception("LLM completion failed")
-        answer = f"Error: Failed to generate answer - {str(e)}"
+        answer = f"I apologize, but I encountered an error while generating the answer. Please try again."
 
+    # Update the log entry with the final answer
     with Session(engine) as session:
         log_entry = session.get(LoggedQuestion, log_id)
         if log_entry:
             log_entry.answer = answer
-            log_entry.model_used = model_name
             session.commit()
 
     return AskResponse(answer=answer)
@@ -731,9 +894,11 @@ async def stt(audio: UploadFile = File(...), lang: Optional[str] = Form(None)):
     ct = (audio.content_type or "").lower()
     if ct not in allowed:
         raise HTTPException(status_code=400, detail=f"Unsupported audio type: {ct}")
+    
     data = await audio.read()
     if not data:
         raise HTTPException(status_code=400, detail="Empty audio file")
+    
     buf = io.BytesIO(data)
     if "webm" in ct:
         ext = ".webm"
@@ -745,15 +910,20 @@ async def stt(audio: UploadFile = File(...), lang: Optional[str] = Form(None)):
         ext = ".wav"
     else:
         ext = ".m4a"
+    
     buf.name = f"recording{ext}"
+    
     try:
         kwargs = {"model": "whisper-1", "file": buf}
+        # Add support for new Indian languages in STT
         supported_langs = {"en", "te", "ta", "hi", "mr", "kn", "ml", "bn"}
         if lang and lang.lower() in supported_langs:
             kwargs["language"] = lang.lower()
+        
         resp = openai_client.audio.transcriptions.create(**kwargs)
         text = (getattr(resp, "text", None) or "").strip()
         return {"text": text}
+    
     except RateLimitError:
         raise HTTPException(status_code=429, detail="OpenAI STT quota exceeded")
     except Exception as e:
@@ -762,11 +932,17 @@ async def stt(audio: UploadFile = File(...), lang: Optional[str] = Form(None)):
 
 @app.post("/tts")
 async def tts(request: Request):
+    """
+    Accept JSON { text, language, voice, speed } OR form data.
+    Returns audio/mpeg stream (gTTS fallback if OpenAI TTS not available).
+    """
     content_type = request.headers.get("content-type", "")
     text = None
     lang = "en"
     voice = None
     speed = 1.0
+
+    use_openai_tts = os.getenv("USE_OPENAI_TTS", "true").lower() in ("1", "true", "yes")
 
     if "application/json" in content_type:
         body = await request.json()
@@ -784,13 +960,14 @@ async def tts(request: Request):
         except (TypeError, ValueError):
             speed = 1.0
 
+    # Validate speed (OpenAI allows 0.25 to 4.0)
     speed = max(0.25, min(4.0, speed))
+
     txt = (text or "").strip()
     if not txt:
         raise HTTPException(status_code=400, detail="text required")
 
-    use_openai_tts = os.getenv("USE_OPENAI_TTS", "true").lower() in ("1", "true", "yes")
-
+    # If OpenAI TTS is enabled
     if use_openai_tts:
         try:
             if hasattr(openai_client, "audio") and hasattr(openai_client.audio, "speech"):
@@ -800,17 +977,16 @@ async def tts(request: Request):
                     input=txt,
                     speed=speed
                 )
-                audio_bytes = getattr(out, "audio", None) or getattr(out, "data", None) or out
-                if isinstance(audio_bytes, (bytes, bytearray)):
-                    return StreamingResponse(io.BytesIO(audio_bytes), media_type="audio/mpeg")
+                audio_bytes = out.content
+                return StreamingResponse(io.BytesIO(audio_bytes), media_type="audio/mpeg")
         except Exception as e:
             logger.warning("OpenAI TTS call failed: %s", repr(e))
-            msg = str(e).lower()
-            if "quota" in msg or "insufficient_quota" in msg or "429" in msg or "too many requests" in msg:
-                logger.warning("OpenAI TTS quota/429 detected; falling back to gTTS")
+            # Fall through to gTTS
 
+    # Fallback to gTTS
     if gTTS is None:
         raise HTTPException(status_code=500, detail="No TTS backend available")
+    
     try:
         gtts_lang_map = {
             "en": "en", "hi": "hi", "ta": "ta", "te": "te",
@@ -821,17 +997,17 @@ async def tts(request: Request):
         bio = io.BytesIO()
         tts.write_to_fp(bio)
         bio.seek(0)
-        
         return StreamingResponse(bio, media_type="audio/mpeg")
     except Exception as e:
         logger.exception("gTTS failed")
         raise HTTPException(status_code=500, detail=f"TTS failed: {str(e)}")
 
 @app.post("/admin/upload")
-async def admin_upload(dataset: str = Form(...), files: List[UploadFile] = File(...), admin = Depends(get_current_admin)):
-    if len(files) > MAX_FILES_PER_UPLOAD:
-        raise HTTPException(status_code=400, detail=f"Free tier limited to {MAX_FILES_PER_UPLOAD} files at once")
-    
+async def admin_upload(
+    dataset: str = Form(...), 
+    files: List[UploadFile] = File(...), 
+    admin = Depends(get_current_admin)
+):
     texts: List[str] = []
     metadatas: List[dict] = []
     ids: List[str] = []
@@ -841,56 +1017,77 @@ async def admin_upload(dataset: str = Form(...), files: List[UploadFile] = File(
             raise HTTPException(status_code=400, detail=f"Only PDF supported: {f.filename}")
         
         data = await f.read()
-        if len(data) > MAX_FILE_SIZE:
-            raise HTTPException(status_code=400, detail=f"File {f.filename} exceeds {MAX_FILE_SIZE//1024//1024}MB limit")
-        
         content = read_pdf(data)
+        
+        # Try OCR if no text found
         if not content.strip():
             try:
                 content = run_ocr_on_pdf(data) if pytesseract else ""
-            except Exception:
+            except Exception as e:
+                logger.warning(f"OCR failed for {f.filename}: {e}")
                 content = ""
+        
         if not content.strip():
+            logger.warning(f"No extractable text found in: {f.filename}")
             continue
-            
+        
         chunks = chunk_text(content)
-        if len(chunks) > MAX_CHUNKS_PER_FILE:
-            chunks = chunks[:MAX_CHUNKS_PER_FILE]
-            
         if not chunks:
+            logger.warning(f"No chunks created from: {f.filename}")
             continue
-            
+        
         texts.extend(chunks)
-        meta = {"filename": f.filename, "admin_username": admin.username, "dataset": dataset}
+        meta = {
+            "filename": f.filename, 
+            "admin_username": admin.username, 
+            "dataset": dataset
+        }
         metadatas.extend([meta] * len(chunks))
         ids.extend([str(uuid.uuid4()) for _ in range(len(chunks))])
     
     if not texts:
         raise HTTPException(status_code=400, detail="No extractable text found in PDFs")
     
-    if len(texts) > 500:
-        texts = texts[:500]
-        metadatas = metadatas[:500]
-        ids = ids[:500]
-    
-    vectors = embed_texts(texts)
-    collection.add(documents=texts, embeddings=vectors, metadatas=metadatas, ids=ids)
+    try:
+        vectors = embed_texts(texts)
+        collection.add(documents=texts, embeddings=vectors, metadatas=metadatas, ids=ids)
+        logger.info(f"Admin uploaded {len(texts)} chunks to dataset: {dataset}")
+    except Exception as e:
+        logger.exception("Failed to add documents to ChromaDB")
+        raise HTTPException(status_code=500, detail=f"Failed to index documents: {str(e)}")
 
+    # Update dataset metadata table
     with Session(engine) as session:
-        prev = session.exec(select(DatasetMeta).where(DatasetMeta.name == dataset).order_by(DatasetMeta.version.desc())).first()
+        prev = session.exec(
+            select(DatasetMeta)
+            .where(DatasetMeta.name == dataset)
+            .order_by(DatasetMeta.version.desc())
+        ).first()
         version = 1 if not prev else prev.version + 1
-        ds = DatasetMeta(name=dataset, created_by=admin.username, version=version, note=f"upload {len(texts)} chunks")
+        ds = DatasetMeta(
+            name=dataset, 
+            created_by=admin.username, 
+            version=version, 
+            note=f"upload {len(texts)} chunks from {len(files)} files"
+        )
         session.add(ds)
         session.commit()
-        session.refresh(ds)
 
-    return {"ok": True, "dataset": dataset, "chunks_indexed": len(texts), "dataset_version": version}
+    return {
+        "ok": True, 
+        "dataset": dataset, 
+        "chunks_indexed": len(texts), 
+        "dataset_version": version,
+        "files_processed": len([f for f in files if f.filename])
+    }
 
 # ---------------------------------------------------------------------
 # Feedback Routes
 # ---------------------------------------------------------------------
+
 @app.post("/feedback")
 async def submit_feedback(feedback: FeedbackRequest):
+    """Store user feedback in the database"""
     try:
         timestamp = feedback.timestamp or datetime.utcnow().isoformat()
         
@@ -921,6 +1118,7 @@ async def get_feedback_logs(
     offset: int = Query(0, ge=0),
     admin = Depends(get_current_admin)
 ):
+    """Get feedback logs with filtering options"""
     try:
         with Session(engine) as session:
             query = select(FeedbackLog)
@@ -946,11 +1144,11 @@ async def get_feedback_logs(
                     "created_at": log.created_at.isoformat()
                 })
             
-            total_query = select(FeedbackLog)
-            total_count = session.exec(total_query).all()
-            good_count = session.exec(total_query.where(FeedbackLog.feedback_type == "good")).all()
-            bad_count = session.exec(total_query.where(FeedbackLog.feedback_type == "bad")).all()
-            no_response_count = session.exec(total_query.where(FeedbackLog.feedback_type == "no_response")).all()
+            # Get summary counts
+            total_count = session.exec(select(FeedbackLog)).all()
+            good_count = session.exec(select(FeedbackLog).where(FeedbackLog.feedback_type == "good")).all()
+            bad_count = session.exec(select(FeedbackLog).where(FeedbackLog.feedback_type == "bad")).all()
+            no_response_count = session.exec(select(FeedbackLog).where(FeedbackLog.feedback_type == "no_response")).all()
             
             summary = {
                 "total": len(total_count),
@@ -978,6 +1176,7 @@ async def get_feedback_stats(
     days: Optional[int] = Query(30, description="Number of days to analyze"),
     admin = Depends(get_current_admin)
 ):
+    """Get feedback statistics and trends"""
     try:
         since_date = datetime.utcnow() - timedelta(days=days)
         
@@ -1009,3 +1208,53 @@ async def get_feedback_stats(
     except Exception as e:
         logger.exception("Failed to fetch feedback stats")
         raise HTTPException(status_code=500, detail="Failed to fetch feedback stats")
+
+@app.get("/health")
+def health():
+    try:
+        # Test ChromaDB
+        chroma_client.heartbeat()
+        chroma_status = "healthy"
+        
+        # Test database
+        with Session(engine) as session:
+            session.exec(select(LoggedQuestion).limit(1))
+        db_status = "healthy"
+        
+    except Exception as e:
+        chroma_status = f"unhealthy: {str(e)}"
+        db_status = "unhealthy"
+    
+    return {
+        "status": "ok", 
+        "provider": "openai",
+        "chromadb": chroma_status,
+        "database": db_status,
+        "ollama": "available" if OLLAMA_AVAILABLE else "unavailable"
+    }
+
+@app.post("/admin/reset-chromadb")
+async def reset_chromadb(admin = Depends(get_current_admin)):
+    """
+    Reset the ChromaDB database (for emergency recovery)
+    """
+    try:
+        global chroma_client, collection
+        
+        # Delete existing database
+        if os.path.exists(CHROMA_DIR):
+            shutil.rmtree(CHROMA_DIR)
+            logger.info("Deleted existing ChromaDB directory")
+        
+        # Reinitialize
+        initialize_chromadb()
+        
+        return {"status": "success", "message": "ChromaDB reset successfully"}
+        
+    except Exception as e:
+        logger.exception("Failed to reset ChromaDB")
+        raise HTTPException(status_code=500, detail=f"Failed to reset ChromaDB: {str(e)}")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
