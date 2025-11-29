@@ -36,9 +36,6 @@ try:
 except Exception:
     gTTS = None
 
-# HTTP client for Ollama
-import requests
-
 # JWT + password context
 import jwt
 from passlib.context import CryptContext
@@ -83,10 +80,6 @@ if not "RENDER" in os.environ:
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-# Ollama config (optional)
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3")
-
 # Fixed admin creds
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "changeme")
@@ -128,36 +121,6 @@ async def free_tier_limits(request: Request, call_next):
     
     response = await call_next(request)
     return response
-
-# ---------------------------------------------------------------------
-# Check Ollama availability
-# ---------------------------------------------------------------------
-def _check_ollama_available(url: str) -> bool:
-    if not url:
-        return False
-    try:
-        health_url = f"{url.rstrip('/')}/api/tags"
-        resp = requests.get(health_url, timeout=5.0)
-        if resp.status_code == 200:
-            data = resp.json()
-            models = data.get("models", [])
-            available_models = [model.get("name") for model in models if model.get("name")]
-            if OLLAMA_MODEL in available_models:
-                logger.info(f"Ollama detected with model '{OLLAMA_MODEL}'")
-                return True
-            else:
-                logger.warning(f"Ollama model '{OLLAMA_MODEL}' not found. Available: {available_models}")
-                return False
-        return False
-    except Exception as e:
-        logger.warning(f"Ollama check failed: {e}")
-        return False
-
-OLLAMA_AVAILABLE = _check_ollama_available(OLLAMA_URL)
-if OLLAMA_AVAILABLE:
-    logger.info("Ollama detected at %s with model %s", OLLAMA_URL, OLLAMA_MODEL)
-else:
-    logger.info("Ollama not detected (will use OpenAI)")
 
 # ---------------------------------------------------------------------
 # DB (SQLModel) for dataset metadata and logs
@@ -327,54 +290,6 @@ def build_prompt(question: str, contexts: List[str], lang_code: Optional[str]) -
     )
 
 # ---------------------------------------------------------------------
-# Ollama helper
-# ---------------------------------------------------------------------
-def ollama_generate(prompt: str, temperature: float = 0.2, max_tokens: int = 512) -> Optional[str]:
-    if not OLLAMA_AVAILABLE or not OLLAMA_URL:
-        logger.warning("Ollama not available")
-        return None
-    
-    url = f"{OLLAMA_URL.rstrip('/')}/api/generate"
-    payload = {
-        "model": OLLAMA_MODEL,
-        "prompt": prompt,
-        "stream": False,
-        "options": {
-            "temperature": float(temperature),
-            "num_predict": int(max_tokens),
-        }
-    }
-    
-    try:
-        resp = requests.post(url, json=payload, timeout=(10.0, 60.0))
-        resp.raise_for_status()
-        data = resp.json()
-        
-        if isinstance(data, dict) and "response" in data:
-            response_text = data["response"].strip()
-            if response_text:
-                logger.info(f"Ollama generation successful: {len(response_text)} chars")
-                return response_text
-        
-        for field in ["text", "output", "content", "completion"]:
-            if field in data and isinstance(data[field], str) and data[field].strip():
-                logger.info(f"Ollama generation successful (fallback field {field})")
-                return data[field].strip()
-                
-        logger.warning(f"Unexpected Ollama response format: {data}")
-        return None
-        
-    except requests.exceptions.Timeout:
-        logger.error("Ollama request timed out")
-        return None
-    except requests.exceptions.ConnectionError:
-        logger.error("Ollama connection failed")
-        return None
-    except Exception as e:
-        logger.error(f"Ollama request failed: {e}")
-        return None
-
-# ---------------------------------------------------------------------
 # Schemas
 # ---------------------------------------------------------------------
 class AskRequest(BaseModel):
@@ -421,49 +336,6 @@ def get_available_models():
             "available": True
         }
     ]
-    
-    ollama_available = OLLAMA_AVAILABLE
-    ollama_model_available = False
-    
-    if ollama_available:
-        try:
-            url = f"{OLLAMA_URL.rstrip('/')}/api/tags"
-            resp = requests.get(url, timeout=5)
-            if resp.status_code == 200:
-                data = resp.json()
-                available_models = [model.get("name") for model in data.get("models", []) if model.get("name")]
-                ollama_model_available = OLLAMA_MODEL in available_models
-        except:
-            ollama_model_available = False
-    
-    if ollama_available and ollama_model_available:
-        models.append({
-            "id": "ollama",
-            "name": f"Ollama {OLLAMA_MODEL}",
-            "provider": "Ollama",
-            "description": "Local AI model for privacy and offline use",
-            "icon": "🦙",
-            "available": True
-        })
-    elif ollama_available:
-        models.append({
-            "id": "ollama",
-            "name": f"Ollama {OLLAMA_MODEL}",
-            "provider": "Ollama",
-            "description": f"Local AI model - model '{OLLAMA_MODEL}' not found",
-            "icon": "🦙",
-            "available": False
-        })
-    else:
-        models.append({
-            "id": "ollama",
-            "name": f"Ollama {OLLAMA_MODEL}",
-            "provider": "Ollama",
-            "description": "Local AI model (Ollama service not available)",
-            "icon": "🦙",
-            "available": False
-        })
-    
     return {"models": models}
 
 @app.post("/admin/login")
@@ -750,13 +622,8 @@ async def ask(req: AskRequest):
     if not q:
         raise HTTPException(status_code=400, detail="Question cannot be empty")
     
-    use_ollama = False
+    # Keep model_name only for logging; we always use OpenAI now
     model_name = req.model or "openai"
-    
-    if model_name and "ollama" in model_name.lower():
-        use_ollama = True
-        if not OLLAMA_AVAILABLE:
-            raise HTTPException(status_code=400, detail="Ollama is not available")
     
     with Session(engine) as session:
         log_entry = LoggedQuestion(
@@ -822,57 +689,20 @@ async def ask(req: AskRequest):
 
     prompt = build_prompt(q, contexts, req.language)
     try:
-        answer = None
-        
-        if use_ollama:
-            try:
-                system_text = "You are a helpful assistant."
-                final_prompt = f"{system_text}\n\n{prompt}"
-                answer = ollama_generate(final_prompt, temperature=0.2, max_tokens=1024)
-                
-                if answer is None:
-                    logger.warning("Ollama generation failed, falling back to OpenAI")
-                    completion = openai_client.chat.completions.create(
-                        model=OPENAI_MODEL,
-                        messages=[
-                            {"role": "system", "content": "You are a helpful assistant."},
-                            {"role": "user", "content": prompt},
-                        ],
-                        temperature=0.2,
-                    )
-                    answer = completion.choices[0].message.content.strip()
-                    model_name = "openai (fallback)"
-                else:
-                    logger.info(f"Generated answer using Ollama: {OLLAMA_MODEL}")
-                    
-            except Exception as e:
-                logger.warning(f"Ollama generation failed: {e}, falling back to OpenAI")
-                completion = openai_client.chat.completions.create(
-                    model=OPENAI_MODEL,
-                    messages=[
-                        {"role": "system", "content": "You are a helpful assistant."},
-                        {"role": "user", "content": prompt},
-                    ],
-                    temperature=0.2,
-                )
-                answer = completion.choices[0].message.content.strip()
-                model_name = "openai (fallback)"
-        else:
-            try:
-                completion = openai_client.chat.completions.create(
-                    model=OPENAI_MODEL,
-                    messages=[
-                        {"role": "system", "content": "You are a helpful assistant."},
-                        {"role": "user", "content": prompt},
-                    ],
-                    temperature=0.2,
-                )
-                answer = completion.choices[0].message.content.strip()
-                logger.info(f"Generated answer using OpenAI: {OPENAI_MODEL}")
-            except Exception as e:
-                logger.warning(f"OpenAI generation failed: {e}")
-                answer = f"Error: OpenAI generation failed - {str(e)}"
-
+        try:
+            completion = openai_client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[
+                    {"role": "system", "content": "You are a helpful assistant."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.2,
+            )
+            answer = completion.choices[0].message.content.strip()
+            logger.info(f"Generated answer using OpenAI: {OPENAI_MODEL}")
+        except Exception as e:
+            logger.warning(f"OpenAI generation failed: {e}")
+            answer = f"Error: OpenAI generation failed - {str(e)}"
     except Exception as e:
         logger.exception("LLM completion failed")
         answer = f"Error: Failed to generate answer - {str(e)}"
