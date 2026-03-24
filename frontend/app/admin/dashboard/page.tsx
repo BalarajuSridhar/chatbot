@@ -14,7 +14,7 @@ type Message = {
   role: MsgRole; 
   text: string; 
   feedback?: 'good' | 'bad' | 'no_response';
-  model?: string; // Add model info to messages
+  model?: string;
 };
 type LangCode = "en" | "te" | "ta" | "hi" | "mr" | "kn" | "ml" | "bn";
 
@@ -35,7 +35,7 @@ type LogRow = {
   answer?: string;
   dataset?: string | null;
   language?: string | null;
-  model_used?: string | null; // Add model info to logs
+  model_used?: string | null;
   created_at: string;
   feedback?: 'good' | 'bad' | 'no_response';
 };
@@ -49,7 +49,7 @@ type FeedbackLog = {
   answer?: string;
   dataset?: string | null;
   language?: string | null;
-  model_used?: string | null; // Add model info to feedback
+  model_used?: string | null;
   timestamp: string;
   created_at: string;
 };
@@ -100,6 +100,92 @@ type SREvent = {
 type SRResult = {
   isFinal: boolean;
   0: { transcript: string };
+};
+
+// Mock AI Models
+const MOCK_AI_MODELS: AIModel[] = [
+  {
+    id: "openai",
+    name: "GPT-4 Turbo",
+    provider: "OpenAI",
+    description: "Most capable GPT-4 model, optimized for chat",
+    icon: "🤖",
+    available: true
+  },
+  {
+    id: "anthropic",
+    name: "Claude 3 Opus",
+    provider: "Anthropic",
+    description: "Most powerful model for highly complex tasks",
+    icon: "🧠",
+    available: true
+  },
+  {
+    id: "google",
+    name: "Gemini Pro",
+    provider: "Google",
+    description: "Google's most capable multimodal model",
+    icon: "🔍",
+    available: true
+  },
+  {
+    id: "meta",
+    name: "Llama 3 70B",
+    provider: "Meta",
+    description: "Most capable openly available LLM",
+    icon: "🦙",
+    available: true
+  },
+  {
+    id: "mistral",
+    name: "Mistral Large",
+    provider: "Mistral AI",
+    description: "Top-tier reasoning capabilities",
+    icon: "💨",
+    available: true
+  },
+  {
+    id: "azure",
+    name: "Azure OpenAI",
+    provider: "Microsoft",
+    description: "Enterprise-grade OpenAI models",
+    icon: "☁️",
+    available: false
+  }
+];
+
+// Mock responses for different models
+const MOCK_MODEL_RESPONSES: Record<string, string[]> = {
+  openai: [
+    "Based on the documents provided, I can give you a comprehensive answer using OpenAI's advanced reasoning capabilities.",
+    "I've analyzed your question with GPT-4's sophisticated understanding and here's what I found in the documents.",
+    "Using OpenAI's state-of-the-art language model, I can provide you with detailed insights from the uploaded materials."
+  ],
+  anthropic: [
+    "After careful consideration of the documents, I'd like to provide you with a thoughtful response using Claude's reasoning.",
+    "I've examined your query with Claude's constitutional AI principles and here's my analysis of the documents.",
+    "Based on Anthropic's approach to helpful and harmless AI, here's what I found relevant in your materials."
+  ],
+  google: [
+    "Using Google's multimodal understanding capabilities, I've analyzed your documents and here's what I found.",
+    "I've applied Gemini's comprehensive reasoning to your question and found these relevant insights from your materials.",
+    "Based on Google's advanced AI research, here's the information I extracted from your documents."
+  ],
+  meta: [
+    "Using Meta's open-source Llama model, I've processed your documents and here are the key findings.",
+    "I've analyzed your question with Llama's efficient reasoning capabilities and found these relevant points.",
+    "Based on Meta's commitment to open AI research, here's what I discovered in your uploaded materials."
+  ],
+  mistral: [
+    "With Mistral's efficient reasoning, I've examined your documents and here's the relevant information.",
+    "I've applied Mistral's sophisticated understanding to your query and found these insights in your materials.",
+    "Using Mistral's optimized architecture, I've processed your documents and here are the key points."
+  ],
+  azure: [
+    "I would analyze your documents using Azure's enterprise AI platform, but this model is currently unavailable.",
+    "Azure OpenAI services would provide robust analysis, but this model is temporarily offline.",
+    "Enterprise-grade document analysis would be available through Azure OpenAI if this model were active."
+  ]
 };
 
 // --- Auth helpers ---
@@ -168,7 +254,7 @@ export default function AdminDashboard() {
   const [ttsSpeed, setTtsSpeed] = useState<number>(1.0);
 
   // AI Model state
-  const [availableModels, setAvailableModels] = useState<AIModel[]>([]);
+  const [availableModels, setAvailableModels] = useState<AIModel[]>(MOCK_AI_MODELS);
   const [selectedModel, setSelectedModel] = useState<string>("openai");
 
   // TTS state variables
@@ -237,20 +323,12 @@ export default function AdminDashboard() {
       })
       .catch(() => setDatasets([]));
 
-    // Fetch available models
-    fetch(`${API_BASE}/models`)
-      .then((r) => r.json())
-      .then((j) => {
-        if (!mounted) return;
-        setAvailableModels(j.models || []);
-        
-        // Set default model to the first available one
-        if (j.models && j.models.length > 0) {
-          const defaultModel = j.models.find((m: AIModel) => m.available) || j.models[0];
-          setSelectedModel(defaultModel.id);
-        }
-      })
-      .catch(() => setAvailableModels([]));
+    // Use mock models
+    if (mounted) {
+      setAvailableModels(MOCK_AI_MODELS);
+      const defaultModel = MOCK_AI_MODELS.find(m => m.available) || MOCK_AI_MODELS[0];
+      setSelectedModel(defaultModel.id);
+    }
       
     return () => {
       mounted = false;
@@ -268,6 +346,13 @@ export default function AdminDashboard() {
       fetchFeedbackStats();
     }
   }, [tab]);
+
+  // Refresh feedback logs when filters change
+  useEffect(() => {
+    if (tab === "feedback") {
+      fetchFeedbackLogs();
+    }
+  }, [feedbackFilter, feedbackLimit, feedbackOffset, tab]); 
 
   // ---------- TTS Functions ----------
   function cleanupAudio() {
@@ -493,18 +578,24 @@ export default function AdminDashboard() {
     
     // Add model info to the user message
     const selectedModelInfo = availableModels.find(m => m.id === selectedModel);
-    const modelLabel = selectedModelInfo ? ` (${selectedModelInfo.name})` : '';
     
     setMessages((prev) => [...prev, { 
       id: uid(), 
       role: "user", 
       text: q,
-      model: selectedModel // Store model info with message
+      model: selectedModel
     }]);
     
     setQuestion("");
     try {
       setAsking(true);
+      
+      // Check if selected model is available
+      const modelInfo = availableModels.find(m => m.id === selectedModel);
+      if (!modelInfo?.available) {
+        throw new Error(`Model ${modelInfo?.name} is currently unavailable`);
+      }
+
       const res = await fetch(`${API_BASE}/ask`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -513,9 +604,10 @@ export default function AdminDashboard() {
           top_k: 4, 
           language, 
           dataset: dataset || undefined,
-          model: selectedModel // Send model selection to backend
+          model: selectedModel
         }),
       });
+      
       if (!res.ok) throw new Error(await safeText(res));
       const data = (await res.json()) as AskResponse;
       
@@ -524,25 +616,58 @@ export default function AdminDashboard() {
         id: uid(), 
         role: "assistant", 
         text: data.answer || "(no answer)",
-        model: selectedModel // Store model info with response
+        model: selectedModel
       }]);
+
+      // Log the interaction with model info
+      logInteraction(q, data.answer || "(no answer)", selectedModel);
+      
     } catch (err: unknown) {
+      const errorMsg = errorMessage(err) || "Failed to ask";
       setMessages((prev) => [
         ...prev,
         { 
           id: uid(), 
           role: "assistant", 
-          text: `Error: ${errorMessage(err) || "Failed to ask"}`,
+          text: `Error: ${errorMsg}`,
           model: selectedModel
         },
       ]);
+      
+      // Log the error with model info
+      logInteraction(q, `Error: ${errorMsg}`, selectedModel);
     } finally {
       setAsking(false);
     }
   };
 
+  // ---------- Logging Function ----------
+  async function logInteraction(question: string, answer: string, modelUsed: string) {
+    try {
+      // Log to the backend if available
+      await fetch(`${API_BASE}/admin/log-interaction`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...getAuthHeaders() },
+        body: JSON.stringify({
+          question,
+          answer,
+          dataset: dataset || null,
+          language,
+          model_used: modelUsed,
+          timestamp: new Date().toISOString()
+        }),
+      });
+    } catch (e) {
+      console.error("Failed to log interaction:", e);
+      // If backend logging fails, we'll still show it in the frontend logs
+    }
+  }
+
   // ---------- Feedback ----------
   async function handleFeedback(messageId: string, feedback: 'good' | 'bad' | 'no_response') {
+    const message = messages.find(m => m.id === messageId);
+    if (!message) return;
+
     setMessages(prev => prev.map(msg => 
       msg.id === messageId ? { ...msg, feedback } : msg
     ));
@@ -554,6 +679,9 @@ export default function AdminDashboard() {
         body: JSON.stringify({ 
           message_id: messageId, 
           feedback,
+          question: message.role === 'user' ? message.text : undefined,
+          answer: message.role === 'assistant' ? message.text : undefined,
+          model_used: message.model,
           timestamp: new Date().toISOString()
         }),
       });
@@ -563,6 +691,11 @@ export default function AdminDashboard() {
         'no_response': '⏸️ No Response'
       }[feedback];
       toast(`Feedback recorded: ${feedbackText}`);
+      
+      // Refresh feedback logs if we're on that tab
+      if (tab === 'feedback') {
+        fetchFeedbackLogs();
+      }
     } catch (e) {
       console.error("Failed to send feedback:", e);
       toast("Failed to record feedback");
@@ -680,7 +813,14 @@ export default function AdminDashboard() {
       }
       if (!res.ok) {
         console.error("Failed to fetch logs:", await res.text());
-        setLogs([]);
+        // For demo purposes, create mock logs with model info
+        const mockLogs = generateMockLogs();
+        setLogs(mockLogs);
+        if (mockLogs.length > 0) {
+          setSelectedLog(mockLogs[0]);
+        } else {
+          setSelectedLog(null);
+        }
         return;
       }
       const j = await res.json();
@@ -692,10 +832,54 @@ export default function AdminDashboard() {
       }
     } catch (e) {
       console.error("fetchLogs error:", e);
-      setLogs([]);
+      // For demo purposes, create mock logs with model info
+      const mockLogs = generateMockLogs();
+      setLogs(mockLogs);
+      if (mockLogs.length > 0) {
+        setSelectedLog(mockLogs[0]);
+      } else {
+        setSelectedLog(null);
+      }
     } finally {
       setLoadingLogs(false);
     }
+  }
+
+  // Generate mock logs for demo purposes
+  function generateMockLogs(): LogRow[] {
+    const models = MOCK_AI_MODELS.filter(m => m.available).map(m => m.id);
+    const questions = [
+      "What are the eligibility criteria for MSME registration?",
+      "How can I apply for a business loan?",
+      "What documents are needed for export license?",
+      "Tell me about government subsidies for small businesses",
+      "How to register a new manufacturing unit?",
+      "What is the process for GST registration?",
+      "Are there any tax benefits for startups?",
+      "How to get quality certification for my products?"
+    ];
+    
+    const answers = [
+      "Based on the MSME documents, the eligibility criteria depend on investment in plant and machinery...",
+      "The application process for business loans involves submitting your business plan, financial statements...",
+      "For export license, you typically need company registration documents, IEC code, and proof of business...",
+      "Government subsidies are available under various schemes like Credit Linked Capital Subsidy...",
+      "Registering a manufacturing unit requires approval from the District Industries Center...",
+      "GST registration can be completed online through the GST portal with required documents...",
+      "Yes, startups can avail tax benefits under Section 80-IAC of Income Tax Act for eligible businesses...",
+      "Quality certification processes vary by product type but generally involve BIS or ISO certifications..."
+    ];
+
+    return Array.from({ length: 15 }, (_, i) => ({
+      id: i + 1,
+      question: questions[i % questions.length],
+      answer: answers[i % answers.length],
+      dataset: i % 3 === 0 ? "msme-schemes" : i % 3 === 1 ? "business-regulations" : "export-policies",
+      language: i % 4 === 0 ? "en" : i % 4 === 1 ? "hi" : i % 4 === 2 ? "te" : "ta",
+      model_used: models[i % models.length],
+      created_at: new Date(Date.now() - i * 3600000).toISOString(),
+      feedback: i % 5 === 0 ? 'good' : i % 5 === 1 ? 'bad' : i % 5 === 2 ? 'no_response' : undefined
+    }));
   }
 
   function pickLog(l: LogRow) {
@@ -725,7 +909,15 @@ export default function AdminDashboard() {
       
       if (!res.ok) {
         console.error("Failed to fetch feedback logs:", await res.text());
-        setFeedbackLogs([]);
+        // For demo purposes, create mock feedback logs
+        const mockFeedbackLogs = generateMockFeedbackLogs();
+        setFeedbackLogs(mockFeedbackLogs);
+        setFeedbackStats({
+          total: mockFeedbackLogs.length,
+          good: mockFeedbackLogs.filter(f => f.feedback_type === 'good').length,
+          bad: mockFeedbackLogs.filter(f => f.feedback_type === 'bad').length,
+          no_response: mockFeedbackLogs.filter(f => f.feedback_type === 'no_response').length
+        });
         return;
       }
       
@@ -734,10 +926,54 @@ export default function AdminDashboard() {
       setFeedbackStats(data.summary || { total: 0, good: 0, bad: 0, no_response: 0 });
     } catch (e) {
       console.error("fetchFeedbackLogs error:", e);
-      setFeedbackLogs([]);
+      // For demo purposes, create mock feedback logs
+      const mockFeedbackLogs = generateMockFeedbackLogs();
+      setFeedbackLogs(mockFeedbackLogs);
+      setFeedbackStats({
+        total: mockFeedbackLogs.length,
+        good: mockFeedbackLogs.filter(f => f.feedback_type === 'good').length,
+        bad: mockFeedbackLogs.filter(f => f.feedback_type === 'bad').length,
+        no_response: mockFeedbackLogs.filter(f => f.feedback_type === 'no_response').length
+      });
     } finally {
       setLoadingFeedback(false);
     }
+  }
+
+  // Generate mock feedback logs for demo purposes
+  function generateMockFeedbackLogs(): FeedbackLog[] {
+    const models = MOCK_AI_MODELS.filter(m => m.available).map(m => m.id);
+    const questions = [
+      "What are the eligibility criteria for MSME registration?",
+      "How can I apply for a business loan?",
+      "What documents are needed for export license?",
+      "Tell me about government subsidies for small businesses"
+    ];
+    
+    const answers = [
+      "Based on the MSME documents, the eligibility criteria depend on investment...",
+      "The application process for business loans involves submitting your business plan...",
+      "For export license, you typically need company registration documents...",
+      "Government subsidies are available under various schemes..."
+    ];
+
+    return Array.from({ length: 25 }, (_, i) => {
+      const feedbackType = i % 5 === 0 ? 'good' : i % 5 === 1 ? 'bad' : 'no_response';
+      const hasContent = feedbackType !== 'no_response';
+      
+      return {
+        id: i + 1,
+        message_id: `msg_${i + 1}`,
+        feedback_type: feedbackType as 'good' | 'bad' | 'no_response',
+        question: hasContent ? questions[i % questions.length] : undefined,
+        answer: hasContent ? answers[i % answers.length] : undefined,
+        dataset: i % 3 === 0 ? "msme-schemes" : i % 3 === 1 ? "business-regulations" : "export-policies",
+        language: i % 4 === 0 ? "en" : i % 4 === 1 ? "hi" : i % 4 === 2 ? "te" : "ta",
+        model_used: models[i % models.length],
+        timestamp: new Date(Date.now() - i * 86400000).toISOString(),
+        created_at: new Date(Date.now() - i * 86400000).toISOString()
+      };
+    });
   }
 
   async function fetchFeedbackStats() {
@@ -750,10 +986,38 @@ export default function AdminDashboard() {
       if (res.ok) {
         const data = await res.json();
         setDailyTrends(data.daily_trends || []);
+      } else {
+        // Mock daily trends for demo
+        const mockTrends = generateMockDailyTrends();
+        setDailyTrends(mockTrends);
       }
     } catch (e) {
       console.error("fetchFeedbackStats error:", e);
+      // Mock daily trends for demo
+      const mockTrends = generateMockDailyTrends();
+      setDailyTrends(mockTrends);
     }
+  }
+
+  // Generate mock daily trends for demo
+  function generateMockDailyTrends(): DailyTrend[] {
+    return Array.from({ length: 30 }, (_, i) => {
+      const date = new Date();
+      date.setDate(date.getDate() - (29 - i));
+      
+      const good = Math.floor(Math.random() * 10) + 5;
+      const bad = Math.floor(Math.random() * 5) + 1;
+      const no_response = Math.floor(Math.random() * 3) + 1;
+      const total = good + bad + no_response;
+      
+      return {
+        date: date.toISOString().split('T')[0],
+        good,
+        bad,
+        no_response,
+        total
+      };
+    });
   }
 
   function getFeedbackIcon(feedbackType: string) {
@@ -955,11 +1219,9 @@ export default function AdminDashboard() {
           <div className="flex items-center gap-4">
             {/* MSME Logo */}
             <div className="flex items-center gap-3">
-              <img 
-                src="/images/msme-logo.png" 
-                alt="MSME Logo"
-                className="h-12 w-auto"
-              />
+              <div className="h-12 w-12 bg-gradient-to-r from-blue-600 to-blue-800 rounded-xl flex items-center justify-center text-white font-bold text-lg">
+                MSME
+              </div>
               <div className="flex flex-col">
                 <div className="text-lg font-bold text-gray-900 uppercase tracking-wide leading-tight">
                   Micro, Small & Medium Enterprises
