@@ -19,7 +19,6 @@ from sqlmodel import SQLModel, create_engine, Session, Field, select
 # vector / embedding / PDF
 import chromadb
 from chromadb.config import Settings
-from sentence_transformers import SentenceTransformer
 import numpy as np
 from pypdf import PdfReader
 
@@ -54,18 +53,15 @@ from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(BASE_DIR, ".env"))
 
-# Gemini API Configuration
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")  # or gemini-1.5-pro
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 
 CHROMA_DIR = os.getenv("CHROMA_DIR", os.path.join(BASE_DIR, "chroma_data"))
 EMBED_MODEL_NAME = os.getenv("EMBED_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2")
 
-# File size limits (10MB)
 MAX_FILE_SIZE = 10 * 1024 * 1024
 MAX_CHUNKS = 1000
 
-# Fixed admin creds
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
 
@@ -73,11 +69,9 @@ JWT_SECRET = os.getenv("JWT_SECRET", "your-secret-key-change-this-in-production"
 JWT_ALGO = "HS256"
 JWT_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "1440"))
 
-# Validate Gemini API Key
 if not GEMINI_API_KEY:
-    raise RuntimeError("GEMINI_API_KEY is required! Please set it in .env file")
+    raise RuntimeError("GEMINI_API_KEY is required! Please set it in .env file or environment variables.")
 
-# Configure Gemini
 genai.configure(api_key=GEMINI_API_KEY)
 
 # ---------------------------------------------------------------------
@@ -91,10 +85,9 @@ logger = logging.getLogger("backend.app")
 
 app = FastAPI(title="PDF Q&A Chatbot with Gemini", version="1.0.0")
 
-# CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure appropriately for production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -135,7 +128,6 @@ class FeedbackLog(SQLModel, table=True):
     timestamp: str
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
-# Create tables
 SQLModel.metadata.create_all(engine)
 
 # ---------------------------------------------------------------------
@@ -168,60 +160,64 @@ async def get_current_admin(token: str = Depends(oauth2_scheme)):
     return {"username": username}
 
 # ---------------------------------------------------------------------
-# Embedder and ChromaDB
+# LAZY Embedder — loads only on first use, does NOT block startup
 # ---------------------------------------------------------------------
-try:
-    _embedder = SentenceTransformer(EMBED_MODEL_NAME, device='cpu')
-    logger.info(f"✓ Embedder loaded: {EMBED_MODEL_NAME} on CPU")
-except Exception as e:
-    logger.error(f"Failed to load embedder: {e}")
-    raise
+_embedder = None
 
-# ChromaDB initialization
-def initialize_chromadb():
-    global chroma_client, collection
-    
+def get_embedder():
+    global _embedder
+    if _embedder is None:
+        logger.info(f"Loading embedder: {EMBED_MODEL_NAME} ...")
+        from sentence_transformers import SentenceTransformer
+        _embedder = SentenceTransformer(EMBED_MODEL_NAME, device='cpu')
+        logger.info("✓ Embedder loaded")
+    return _embedder
+
+# ---------------------------------------------------------------------
+# LAZY ChromaDB — initializes only on first use, does NOT block startup
+# ---------------------------------------------------------------------
+_chroma_client = None
+_collection = None
+
+def get_collection():
+    global _chroma_client, _collection
+    if _collection is not None:
+        return _collection
+
     os.makedirs(CHROMA_DIR, exist_ok=True)
-    
     try:
-        chroma_client = chromadb.PersistentClient(
+        _chroma_client = chromadb.PersistentClient(
             path=CHROMA_DIR,
             settings=Settings(anonymized_telemetry=False, allow_reset=True)
         )
-        chroma_client.heartbeat()
-        
+        _chroma_client.heartbeat()
         try:
-            collection = chroma_client.get_collection("pdf_docs")
+            _collection = _chroma_client.get_collection("pdf_docs")
             logger.info("✓ Using existing ChromaDB collection")
-        except:
-            collection = chroma_client.create_collection(
+        except Exception:
+            _collection = _chroma_client.create_collection(
                 name="pdf_docs",
                 metadata={"hnsw:space": "cosine"}
             )
             logger.info("✓ Created new ChromaDB collection")
-        
         logger.info(f"✓ ChromaDB initialized at {CHROMA_DIR}")
-        return True
-        
     except Exception as e:
-        logger.error(f"Failed to initialize ChromaDB: {e}")
-        try:
-            chroma_client = chromadb.EphemeralClient()
-            collection = chroma_client.get_or_create_collection("pdf_docs")
-            logger.warning("⚠ Using in-memory ChromaDB as fallback")
-            return True
-        except Exception as e2:
-            logger.error(f"Even in-memory ChromaDB failed: {e2}")
-            return False
+        logger.error(f"PersistentClient failed: {e} — falling back to in-memory")
+        _chroma_client = chromadb.EphemeralClient()
+        _collection = _chroma_client.get_or_create_collection("pdf_docs")
+        logger.warning("⚠ Using in-memory ChromaDB (data will not persist)")
 
-if not initialize_chromadb():
-    raise RuntimeError("Failed to initialize ChromaDB")
+    return _collection
 
+# ---------------------------------------------------------------------
+# Embed helper
+# ---------------------------------------------------------------------
 def embed_texts(texts: List[str]) -> List[List[float]]:
     if not texts:
         return []
     try:
-        embs = _embedder.encode(texts, normalize_embeddings=True, show_progress_bar=False)
+        embedder = get_embedder()
+        embs = embedder.encode(texts, normalize_embeddings=True, show_progress_bar=False)
         return embs.tolist() if isinstance(embs, np.ndarray) else embs
     except Exception as e:
         logger.error(f"Failed to embed texts: {e}")
@@ -248,7 +244,6 @@ def read_pdf(file_bytes: bytes) -> str:
 def run_ocr_on_pdf(file_bytes: bytes) -> str:
     if not OCR_AVAILABLE:
         return ""
-    
     parts = []
     try:
         images = convert_from_bytes(file_bytes, fmt="jpeg", dpi=200)
@@ -267,13 +262,10 @@ def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 150) -> List[st
     text = " ".join((text or "").split()).strip()
     if not text:
         return []
-    
     if overlap >= chunk_size:
         overlap = max(0, chunk_size // 5)
-    
     step = max(1, chunk_size - overlap)
     chunks = []
-    
     for start in range(0, len(text), step):
         end = min(start + chunk_size, len(text))
         chunk = text[start:end].strip()
@@ -281,7 +273,6 @@ def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 150) -> List[st
             chunks.append(chunk)
         if end == len(text):
             break
-    
     return chunks
 
 LANG_NAME = {
@@ -292,7 +283,6 @@ LANG_NAME = {
 def build_prompt(question: str, contexts: List[str], lang_code: Optional[str]) -> str:
     language_name = LANG_NAME.get((lang_code or "en").lower(), "English")
     context_block = "\n\n".join([f"[Source {i+1}]\n{c}" for i, c in enumerate(contexts)])
-    
     return (
         "You are a helpful assistant. Use only the provided context to answer. "
         "If the answer isn't in the context, say you don't know. "
@@ -305,31 +295,23 @@ def build_prompt(question: str, contexts: List[str], lang_code: Optional[str]) -
 # Gemini helper
 # ---------------------------------------------------------------------
 def gemini_generate(prompt: str, temperature: float = 0.2, max_tokens: int = 1024) -> Optional[str]:
-    """Generate text using Google Gemini API"""
     try:
-        # Configure the model
         generation_config = {
             "temperature": temperature,
             "max_output_tokens": max_tokens,
             "top_p": 0.95,
             "top_k": 40,
         }
-        
-        # Create model instance
         model = genai.GenerativeModel(
             model_name=GEMINI_MODEL,
             generation_config=generation_config
         )
-        
-        # Generate response
         response = model.generate_content(prompt)
-        
         if response and response.text:
             return response.text.strip()
         else:
             logger.warning("Gemini returned empty response")
             return None
-            
     except Exception as e:
         logger.error(f"Gemini generation failed: {e}")
         return None
@@ -342,10 +324,6 @@ class AskRequest(BaseModel):
     top_k: int = 4
     language: Optional[str] = None
     dataset: Optional[str] = None
-
-class IngestResponse(BaseModel):
-    documents_added: int
-    chunks_indexed: int
 
 class AskResponse(BaseModel):
     answer: str
@@ -377,50 +355,44 @@ async def root():
 
 @app.get("/health")
 async def health():
-    """Health check endpoint"""
+    chroma_status = "not_initialized"
+    db_status = "healthy"
+    gemini_status = "not_tested"
+
     try:
-        # Test ChromaDB
-        chroma_client.heartbeat()
-        chroma_status = "healthy"
-        
-        # Test database
         with Session(engine) as session:
             session.exec(select(LoggedQuestion).limit(1))
         db_status = "healthy"
-        
-        # Test Gemini
-        try:
-            test_model = genai.GenerativeModel(GEMINI_MODEL)
-            test_model.generate_content("test", generation_config={"max_output_tokens": 5})
-            gemini_status = "healthy"
-        except Exception as e:
-            gemini_status = f"unhealthy: {str(e)}"
-        
     except Exception as e:
-        chroma_status = f"unhealthy: {str(e)}"
-        db_status = "unhealthy"
-        gemini_status = "unknown"
-    
+        db_status = f"unhealthy: {str(e)}"
+
+    # Only test chroma if already initialized (don't trigger lazy load here)
+    if _chroma_client is not None:
+        try:
+            _chroma_client.heartbeat()
+            chroma_status = "healthy"
+        except Exception as e:
+            chroma_status = f"unhealthy: {str(e)}"
+
     return {
         "status": "ok",
-        "gemini": gemini_status,
-        "model": GEMINI_MODEL,
+        "gemini_model": GEMINI_MODEL,
         "chromadb": chroma_status,
         "database": db_status,
         "ocr": OCR_AVAILABLE,
-        "tts": GTTS_AVAILABLE
+        "tts": GTTS_AVAILABLE,
+        "embedder_loaded": _embedder is not None
     }
 
 @app.get("/models")
 async def get_available_models():
-    """Get available AI models"""
     return {
         "models": [
             {
                 "id": "gemini",
                 "name": f"Google {GEMINI_MODEL}",
                 "provider": "Google Gemini",
-                "description": "Google's advanced AI model with strong reasoning capabilities",
+                "description": "Google's advanced AI model",
                 "icon": "🌟",
                 "available": True
             }
@@ -429,22 +401,17 @@ async def get_available_models():
 
 @app.post("/admin/login")
 async def admin_login(payload: dict = Body(...)):
-    """Admin login endpoint"""
     username = payload.get("username")
     password = payload.get("password")
-    
     if username != ADMIN_USERNAME or password != ADMIN_PASSWORD:
         raise HTTPException(status_code=401, detail="Invalid credentials")
-    
     token = create_access_token(sub=ADMIN_USERNAME, username=ADMIN_USERNAME)
     return {"access_token": token, "token_type": "bearer"}
 
 @app.post("/admin/token")
 async def admin_token(form_data: OAuth2PasswordRequestForm = Depends()):
-    """OAuth2 token endpoint"""
     if form_data.username != ADMIN_USERNAME or form_data.password != ADMIN_PASSWORD:
         raise HTTPException(status_code=401, detail="Invalid credentials")
-    
     token = create_access_token(sub=ADMIN_USERNAME, username=ADMIN_USERNAME)
     return {"access_token": token, "token_type": "bearer"}
 
@@ -452,9 +419,8 @@ async def admin_token(form_data: OAuth2PasswordRequestForm = Depends()):
 async def get_logged_questions(
     limit: int = Query(200, gt=0, le=1000),
     since: Optional[str] = Query(None),
-    admin = Depends(get_current_admin)
+    admin=Depends(get_current_admin)
 ):
-    """Get logged questions"""
     with Session(engine) as session:
         q = select(LoggedQuestion).order_by(LoggedQuestion.created_at.desc())
         if since:
@@ -463,11 +429,9 @@ async def get_logged_questions(
                 q = q.where(LoggedQuestion.created_at >= since_dt)
             except Exception as e:
                 logger.warning(f"Invalid 'since' param {since}: {e}")
-        
         rows = session.exec(q.limit(limit)).all()
-        out = []
-        for r in rows:
-            out.append({
+        return {"logs": [
+            {
                 "id": r.id,
                 "question": r.question,
                 "answer": r.answer,
@@ -475,22 +439,21 @@ async def get_logged_questions(
                 "language": r.language,
                 "model_used": r.model_used,
                 "created_at": r.created_at.isoformat(),
-            })
-        return {"logs": out}
+            }
+            for r in rows
+        ]}
 
 @app.get("/datasets")
 async def list_datasets():
-    """List all available datasets"""
     try:
+        collection = get_collection()
         results = collection.get(include=["metadatas"])
         metadatas = results.get("metadatas", [])
         datasets = set()
-        
         for meta in metadatas:
             if isinstance(meta, dict) and "dataset" in meta:
                 if meta["dataset"] and meta["dataset"].strip():
                     datasets.add(meta["dataset"].strip())
-        
         return {"datasets": sorted(list(datasets))}
     except Exception as e:
         logger.error(f"Failed to list datasets: {e}")
@@ -502,67 +465,56 @@ async def ingest_pdfs(
     dataset: Optional[str] = Form(None),
     ocr: bool = Form(False)
 ):
-    """Upload and index PDF files"""
+    collection = get_collection()
     texts = []
     metadatas = []
     ids = []
     processed_files = []
-    
+
     for f in files:
         if not f.filename.lower().endswith(".pdf"):
-            raise HTTPException(status_code=400, detail=f"Only PDF files are supported: {f.filename}")
-        
-        # Check file size
+            raise HTTPException(status_code=400, detail=f"Only PDF files supported: {f.filename}")
+
         data = await f.read()
         if len(data) > MAX_FILE_SIZE:
-            raise HTTPException(status_code=413, detail=f"File too large: {f.filename} (max {MAX_FILE_SIZE//1024//1024}MB)")
-        
-        # Extract text
+            raise HTTPException(status_code=413, detail=f"File too large: {f.filename}")
+
         content = read_pdf(data)
         used_ocr = False
-        
+
         if not content.strip() and ocr:
             try:
                 content = run_ocr_on_pdf(data)
                 used_ocr = True
-                if content.strip():
-                    logger.info(f"✓ OCR successful for {f.filename}")
             except Exception as e:
                 logger.warning(f"OCR failed for {f.filename}: {e}")
-        
+
         if not content.strip():
             logger.warning(f"⚠ No text found in {f.filename}")
             continue
-        
-        # Chunk the text
+
         chunks = chunk_text(content)
         if not chunks:
-            logger.warning(f"⚠ No chunks created from {f.filename}")
             continue
-        
-        # Limit chunks
+
         if len(chunks) > MAX_CHUNKS:
             chunks = chunks[:MAX_CHUNKS]
-            logger.warning(f"⚠ Limited chunks to {MAX_CHUNKS} for {f.filename}")
-        
-        # Prepare metadata
+
         meta = {
             "filename": f.filename,
             "ocr": used_ocr,
             "dataset": dataset or "default"
         }
-        
+
         texts.extend(chunks)
         metadatas.extend([meta] * len(chunks))
         ids.extend([str(uuid.uuid4()) for _ in range(len(chunks))])
         processed_files.append(f.filename)
-        
         logger.info(f"✓ Processed {f.filename}: {len(chunks)} chunks")
-    
+
     if not texts:
         raise HTTPException(status_code=400, detail="No extractable text found in any PDF")
-    
-    # Generate embeddings and add to ChromaDB
+
     try:
         vectors = embed_texts(texts)
         collection.add(
@@ -571,9 +523,6 @@ async def ingest_pdfs(
             metadatas=metadatas,
             ids=ids
         )
-        
-        logger.info(f"✓ Added {len(texts)} chunks from {len(processed_files)} files")
-        
         return {
             "success": True,
             "documents_added": len(processed_files),
@@ -581,38 +530,34 @@ async def ingest_pdfs(
             "files": processed_files,
             "dataset": dataset or "default"
         }
-        
     except Exception as e:
-        logger.error(f"Failed to add documents to ChromaDB: {e}")
+        logger.error(f"Failed to add to ChromaDB: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to index documents: {str(e)}")
 
 @app.post("/ask", response_model=AskResponse)
 async def ask_question(req: AskRequest):
-    """Ask a question based on indexed PDFs using Gemini"""
     question = (req.question or "").strip()
     if not question:
         raise HTTPException(status_code=400, detail="Question cannot be empty")
-    
-    # Log question
+
     with Session(engine) as session:
         log_entry = LoggedQuestion(
             question=question,
             dataset=req.dataset,
             language=req.language,
-            model_used=f"gemini-{GEMINI_MODEL}"
+            model_used=GEMINI_MODEL
         )
         session.add(log_entry)
         session.commit()
         log_id = log_entry.id
-    
+
     try:
-        # Embed question
+        collection = get_collection()
         qvecs = embed_texts([question])
         if not qvecs:
             raise Exception("Empty embedding result")
         qvec = qvecs[0]
-        
-        # Query ChromaDB
+
         if req.dataset:
             results = collection.query(
                 query_embeddings=[qvec],
@@ -624,45 +569,28 @@ async def ask_question(req: AskRequest):
                 query_embeddings=[qvec],
                 n_results=max(1, req.top_k)
             )
-        
-        # Extract contexts
+
         contexts = []
         docs = results.get("documents", [[]])
         if docs and len(docs) > 0:
             contexts = docs[0] if isinstance(docs[0], list) else list(docs)
-        
+
         if not contexts:
             answer = "I couldn't find relevant content in the indexed PDFs to answer your question."
-            with Session(engine) as session:
-                log_entry = session.get(LoggedQuestion, log_id)
-                if log_entry:
-                    log_entry.answer = answer
-                    session.commit()
-            return AskResponse(answer=answer)
-        
-        # Build prompt and generate answer with Gemini
-        prompt = build_prompt(question, contexts, req.language)
-        
-        # Generate with Gemini
-        try:
+        else:
+            prompt = build_prompt(question, contexts, req.language)
             answer = gemini_generate(prompt, temperature=0.2, max_tokens=1024)
-            
             if not answer:
                 answer = "I apologize, but I couldn't generate a proper answer. Please try again."
-                
-        except Exception as e:
-            logger.error(f"Gemini generation failed: {e}")
-            answer = f"I apologize, but I encountered an error generating the answer: {str(e)}"
-        
-        # Update log with answer
+
         with Session(engine) as session:
             log_entry = session.get(LoggedQuestion, log_id)
             if log_entry:
                 log_entry.answer = answer
                 session.commit()
-        
+
         return AskResponse(answer=answer)
-        
+
     except Exception as e:
         logger.error(f"Ask endpoint error: {e}")
         with Session(engine) as session:
@@ -674,7 +602,6 @@ async def ask_question(req: AskRequest):
 
 @app.post("/feedback")
 async def submit_feedback(feedback: FeedbackRequest):
-    """Store user feedback"""
     try:
         with Session(engine) as session:
             feedback_entry = FeedbackLog(
@@ -686,9 +613,7 @@ async def submit_feedback(feedback: FeedbackRequest):
             )
             session.add(feedback_entry)
             session.commit()
-        
         return {"status": "success", "message": "Feedback recorded"}
-        
     except Exception as e:
         logger.error(f"Failed to record feedback: {e}")
         raise HTTPException(status_code=500, detail="Failed to record feedback")
@@ -698,24 +623,21 @@ async def get_feedback_logs(
     feedback_type: Optional[str] = Query(None),
     limit: int = Query(100, gt=0, le=1000),
     offset: int = Query(0, ge=0),
-    admin = Depends(get_current_admin)
+    admin=Depends(get_current_admin)
 ):
-    """Get feedback logs"""
     try:
         with Session(engine) as session:
             query = select(FeedbackLog)
             if feedback_type:
                 query = query.where(FeedbackLog.feedback_type == feedback_type)
-            
             query = query.order_by(FeedbackLog.created_at.desc()).offset(offset).limit(limit)
             logs = session.exec(query).all()
-            
-            # Get counts
+
             total = len(session.exec(select(FeedbackLog)).all())
             good = len(session.exec(select(FeedbackLog).where(FeedbackLog.feedback_type == "good")).all())
             bad = len(session.exec(select(FeedbackLog).where(FeedbackLog.feedback_type == "bad")).all())
             no_response = len(session.exec(select(FeedbackLog).where(FeedbackLog.feedback_type == "no_response")).all())
-            
+
             return {
                 "feedback_logs": [
                     {
@@ -736,18 +658,15 @@ async def get_feedback_logs(
                     "no_response": no_response
                 }
             }
-            
     except Exception as e:
         logger.error(f"Failed to fetch feedback logs: {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch feedback logs")
 
+# ---------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", 8000))  # ✅ reads Render's PORT
-    logger.info(f"Starting PDF Q&A Chatbot Backend on port {port}...")
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=port,
-        log_level="info"
-    )
+    port = int(os.environ.get("PORT", 8000))
+    logger.info(f"Starting on port {port}...")
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
