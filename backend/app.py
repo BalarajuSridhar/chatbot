@@ -743,10 +743,11 @@ async def get_feedback_logs(
 
 if __name__ == "__main__":
     import uvicorn
-    logger.info("Starting PDF Q&A Chatbot Backend with Gemini...")
+    port = int(os.environ.get("PORT", 8000))  # ✅ reads Render's PORT
+    logger.info(f"Starting PDF Q&A Chatbot Backend on port {port}...")
     uvicorn.run(
         app,
         host="0.0.0.0",
-        port=8000,
+        port=port,
         log_level="info"
     )
