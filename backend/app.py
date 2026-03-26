@@ -3,13 +3,12 @@ import os
 import io
 import uuid
 import logging
-import shutil
-from typing import Optional, List, Any
+from typing import Optional, List
 from datetime import datetime, timedelta
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Depends, Body, Request, Query
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Depends, Body, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
@@ -22,8 +21,8 @@ from chromadb.config import Settings
 import numpy as np
 from pypdf import PdfReader
 
-# Google Gemini API
-import google.generativeai as genai
+# Google Gemini API - USING NEW PACKAGE
+from google import genai
 
 # Optional OCR + TTS fallbacks
 try:
@@ -72,7 +71,13 @@ JWT_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "1440"))
 if not GEMINI_API_KEY:
     raise RuntimeError("GEMINI_API_KEY is required! Please set it in .env file or environment variables.")
 
-genai.configure(api_key=GEMINI_API_KEY)
+# Initialize Gemini client with new API
+try:
+    genai_client = genai.Client(api_key=GEMINI_API_KEY)
+    logger = logging.getLogger("backend.app")
+    logger.info("✓ Gemini client initialized successfully")
+except Exception as e:
+    raise RuntimeError(f"Failed to initialize Gemini client: {e}")
 
 # ---------------------------------------------------------------------
 # Logging & app
@@ -128,6 +133,7 @@ class FeedbackLog(SQLModel, table=True):
     timestamp: str
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
+# Create tables
 SQLModel.metadata.create_all(engine)
 
 # ---------------------------------------------------------------------
@@ -160,7 +166,7 @@ async def get_current_admin(token: str = Depends(oauth2_scheme)):
     return {"username": username}
 
 # ---------------------------------------------------------------------
-# LAZY Embedder — loads only on first use, does NOT block startup
+# LAZY Embedder — loads only on first use
 # ---------------------------------------------------------------------
 _embedder = None
 
@@ -174,7 +180,7 @@ def get_embedder():
     return _embedder
 
 # ---------------------------------------------------------------------
-# LAZY ChromaDB — initializes only on first use, does NOT block startup
+# LAZY ChromaDB — initializes only on first use
 # ---------------------------------------------------------------------
 _chroma_client = None
 _collection = None
@@ -292,21 +298,22 @@ def build_prompt(question: str, contexts: List[str], lang_code: Optional[str]) -
     )
 
 # ---------------------------------------------------------------------
-# Gemini helper
+# Gemini helper - UPDATED FOR NEW API
 # ---------------------------------------------------------------------
 def gemini_generate(prompt: str, temperature: float = 0.2, max_tokens: int = 1024) -> Optional[str]:
     try:
-        generation_config = {
-            "temperature": temperature,
-            "max_output_tokens": max_tokens,
-            "top_p": 0.95,
-            "top_k": 40,
-        }
-        model = genai.GenerativeModel(
-            model_name=GEMINI_MODEL,
-            generation_config=generation_config
+        # Using the new google.genai client
+        response = genai_client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config={
+                "temperature": temperature,
+                "max_output_tokens": max_tokens,
+                "top_p": 0.95,
+                "top_k": 40,
+            }
         )
-        response = model.generate_content(prompt)
+        
         if response and response.text:
             return response.text.strip()
         else:
@@ -366,7 +373,18 @@ async def health():
     except Exception as e:
         db_status = f"unhealthy: {str(e)}"
 
-    # Only test chroma if already initialized (don't trigger lazy load here)
+    # Test Gemini connection
+    try:
+        test_response = genai_client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents="Test connection",
+            config={"max_output_tokens": 5}
+        )
+        gemini_status = "healthy" if test_response and test_response.text else "unhealthy"
+    except Exception as e:
+        gemini_status = f"unhealthy: {str(e)}"
+
+    # Only test chroma if already initialized
     if _chroma_client is not None:
         try:
             _chroma_client.heartbeat()
@@ -377,6 +395,7 @@ async def health():
     return {
         "status": "ok",
         "gemini_model": GEMINI_MODEL,
+        "gemini_status": gemini_status,
         "chromadb": chroma_status,
         "database": db_status,
         "ocr": OCR_AVAILABLE,
