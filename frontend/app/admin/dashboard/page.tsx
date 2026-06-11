@@ -2,7 +2,7 @@
 "use client";
 
 import { useRouter } from "next/navigation";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
 
@@ -78,9 +78,8 @@ type FileInfo = {
   admin_username?: string;
 };
 
-// Minimal Web Speech types so TS doesn't require lib.dom
+// Web Speech types
 type SRConstructor = new () => SR;
-
 type SR = {
   lang: string;
   interimResults: boolean;
@@ -91,104 +90,29 @@ type SR = {
   onerror: ((e: Event) => void) | null;
   onend: (() => void) | null;
 };
-
 type SREvent = {
   resultIndex: number;
   results: ArrayLike<SRResult>;
 };
-
 type SRResult = {
   isFinal: boolean;
   0: { transcript: string };
 };
-
-// Mock AI Models
-const MOCK_AI_MODELS: AIModel[] = [
-  {
-    id: "openai",
-    name: "GPT-4 Turbo",
-    provider: "OpenAI",
-    description: "Most capable GPT-4 model, optimized for chat",
-    icon: "🤖",
-    available: true
-  },
-  {
-    id: "anthropic",
-    name: "Claude 3 Opus",
-    provider: "Anthropic",
-    description: "Most powerful model for highly complex tasks",
-    icon: "🧠",
-    available: true
-  },
-  {
-    id: "google",
-    name: "Gemini Pro",
-    provider: "Google",
-    description: "Google's most capable multimodal model",
-    icon: "🔍",
-    available: true
-  },
-  {
-    id: "meta",
-    name: "Llama 3 70B",
-    provider: "Meta",
-    description: "Most capable openly available LLM",
-    icon: "🦙",
-    available: true
-  },
-  {
-    id: "mistral",
-    name: "Mistral Large",
-    provider: "Mistral AI",
-    description: "Top-tier reasoning capabilities",
-    icon: "💨",
-    available: true
-  },
-  {
-    id: "azure",
-    name: "Azure OpenAI",
-    provider: "Microsoft",
-    description: "Enterprise-grade OpenAI models",
-    icon: "☁️",
-    available: false
-  }
-];
-
-// Mock responses for different models
-const MOCK_MODEL_RESPONSES: Record<string, string[]> = {
-  openai: [
-    "Based on the documents provided, I can give you a comprehensive answer using OpenAI's advanced reasoning capabilities.",
-    "I've analyzed your question with GPT-4's sophisticated understanding and here's what I found in the documents.",
-    "Using OpenAI's state-of-the-art language model, I can provide you with detailed insights from the uploaded materials."
-  ],
-  anthropic: [
-    "After careful consideration of the documents, I'd like to provide you with a thoughtful response using Claude's reasoning.",
-    "I've examined your query with Claude's constitutional AI principles and here's my analysis of the documents.",
-    "Based on Anthropic's approach to helpful and harmless AI, here's what I found relevant in your materials."
-  ],
-  google: [
-    "Using Google's multimodal understanding capabilities, I've analyzed your documents and here's what I found.",
-    "I've applied Gemini's comprehensive reasoning to your question and found these relevant insights from your materials.",
-    "Based on Google's advanced AI research, here's the information I extracted from your documents."
-  ],
-  meta: [
-    "Using Meta's open-source Llama model, I've processed your documents and here are the key findings.",
-    "I've analyzed your question with Llama's efficient reasoning capabilities and found these relevant points.",
-    "Based on Meta's commitment to open AI research, here's what I discovered in your uploaded materials."
-  ],
-  mistral: [
-    "With Mistral's efficient reasoning, I've examined your documents and here's the relevant information.",
-    "I've applied Mistral's sophisticated understanding to your query and found these insights in your materials.",
-    "Using Mistral's optimized architecture, I've processed your documents and here are the key points."
-  ],
-  azure: [
-    "I would analyze your documents using Azure's enterprise AI platform, but this model is currently unavailable.",
-    "Azure OpenAI services would provide robust analysis, but this model is temporarily offline.",
-    "Enterprise-grade document analysis would be available through Azure OpenAI if this model were active."
-  ]
+type BlobEvent = Event & {
+  data: Blob;
 };
 
-// --- Auth helpers ---
+// Gemini Model (only one we need)
+const GEMINI_MODEL: AIModel = {
+  id: "gemini",
+  name: "Gemini 1.5 Flash",
+  provider: "Google",
+  description: "Google's fast and efficient AI model for document Q&A",
+  icon: "🌟",
+  available: true
+};
+
+// Auth helpers
 function verifyAdminToken(token: string | null): boolean {
   if (!token) return false;
   try {
@@ -209,7 +133,6 @@ function getAuthHeaders(): HeadersInit {
   return token ? { Authorization: `Bearer ${token}` } : {};
 }
 
-// Helper function to get language name
 function getLanguageName(code: LangCode): string {
   const names: Record<LangCode, string> = {
     "en": "English",
@@ -224,12 +147,6 @@ function getLanguageName(code: LangCode): string {
   return names[code] || code;
 }
 
-// Helper function to get model display name
-function getModelDisplayName(modelId: string, availableModels: AIModel[]): string {
-  const model = availableModels.find(m => m.id === modelId);
-  return model ? model.name : modelId;
-}
-
 export default function AdminDashboard() {
   const [files, setFiles] = useState<File[]>([]);
   const [uploadedFiles, setUploadedFiles] = useState<FileInfo[]>([]);
@@ -241,7 +158,7 @@ export default function AdminDashboard() {
     {
       id: uid(),
       role: "system",
-      text: "Upload PDFs, click 'Upload & Index', then ask questions. Use the mic to dictate.",
+      text: "Upload PDFs, then ask questions about them. Using Google Gemini AI.",
     },
   ]);
 
@@ -251,13 +168,14 @@ export default function AdminDashboard() {
   const [useBrowserSTT, setUseBrowserSTT] = useState(true);
   const [recording, setRecording] = useState(false);
   const [uploadMessage, setUploadMessage] = useState("");
+  const [uploadError, setUploadError] = useState<string | null>(null);
   const [ttsSpeed, setTtsSpeed] = useState<number>(1.0);
+  const [backendHealth, setBackendHealth] = useState<boolean>(true);
 
-  // AI Model state
-  const [availableModels, setAvailableModels] = useState<AIModel[]>(MOCK_AI_MODELS);
-  const [selectedModel, setSelectedModel] = useState<string>("openai");
+  // AI Model state (just Gemini)
+  const [selectedModel] = useState<string>("gemini");
 
-  // TTS state variables
+  // TTS state
   const [ttsPlaying, setTtsPlaying] = useState(false);
   const [pausedAudioUrl, setPausedAudioUrl] = useState<string | null>(null);
   const [pausedTime, setPausedTime] = useState<number>(0);
@@ -275,7 +193,7 @@ export default function AdminDashboard() {
   const [dailyTrends, setDailyTrends] = useState<DailyTrend[]>([]);
   const [loadingFeedback, setLoadingFeedback] = useState(false);
   const [feedbackFilter, setFeedbackFilter] = useState<string>("all");
-  const [feedbackLimit, setFeedbackLimit] = useState<number>(100);
+  const [feedbackLimit] = useState<number>(100);
   const [feedbackOffset, setFeedbackOffset] = useState<number>(0);
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -288,14 +206,31 @@ export default function AdminDashboard() {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const lastAudioUrlRef = useRef<string | null>(null);
 
-  useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, asking]);
-
   const router = useRouter();
   const [adminToken, setAdminToken] = useState<string | null>(() =>
     typeof window !== "undefined" ? localStorage.getItem("admin_token") : null
   );
+
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages, asking]);
+
+  // Check backend health
+  useEffect(() => {
+    const checkHealth = async () => {
+      try {
+        const res = await fetch(`${API_BASE}/health`);
+        if (res.ok) {
+          setBackendHealth(true);
+        } else {
+          setBackendHealth(false);
+        }
+      } catch {
+        setBackendHealth(false);
+      }
+    };
+    checkHealth();
+  }, []);
 
   // verify token on mount
   useEffect(() => {
@@ -310,11 +245,10 @@ export default function AdminDashboard() {
     }
   }, [router]);
 
-  // fetch datasets and models once
+  // fetch datasets
   useEffect(() => {
     let mounted = true;
     
-    // Fetch datasets
     fetch(`${API_BASE}/datasets`)
       .then((r) => r.json())
       .then((j) => {
@@ -322,13 +256,6 @@ export default function AdminDashboard() {
         setDatasets(j.datasets || []);
       })
       .catch(() => setDatasets([]));
-
-    // Use mock models
-    if (mounted) {
-      setAvailableModels(MOCK_AI_MODELS);
-      const defaultModel = MOCK_AI_MODELS.find(m => m.available) || MOCK_AI_MODELS[0];
-      setSelectedModel(defaultModel.id);
-    }
       
     return () => {
       mounted = false;
@@ -352,7 +279,7 @@ export default function AdminDashboard() {
     if (tab === "feedback") {
       fetchFeedbackLogs();
     }
-  }, [feedbackFilter, feedbackLimit, feedbackOffset, tab]); 
+  }, [feedbackFilter, feedbackOffset, tab]); 
 
   // ---------- TTS Functions ----------
   function cleanupAudio() {
@@ -370,6 +297,7 @@ export default function AdminDashboard() {
       }
       setPausedAudioUrl(null);
       setPausedTime(0);
+      setTtsPlaying(false);
     } catch (e) {}
   }
 
@@ -384,18 +312,14 @@ export default function AdminDashboard() {
         a.currentTime = pausedTime;
         a.onended = () => {
           cleanupAudio();
-          setTtsPlaying(false);
         };
         await a.play();
         setTtsPlaying(true);
         return;
       }
 
-      // If an audio is already playing, stop it and revoke its URL
+      // If an audio is already playing, stop it
       if (audioRef.current) {
-        try {
-          audioRef.current.pause();
-        } catch {}
         cleanupAudio();
       }
 
@@ -412,21 +336,29 @@ export default function AdminDashboard() {
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
 
-      // store the last URL so we can revoke it later
       lastAudioUrlRef.current = url;
 
       const a = new Audio(url);
       audioRef.current = a;
       a.onended = () => {
         cleanupAudio();
-        setTtsPlaying(false);
       };
       await a.play();
       setTtsPlaying(true);
     } catch (e) {
-      toast("TTS failed");
-      console.error(e);
-      setTtsPlaying(false);
+      // Fallback to browser speech synthesis if TTS fails
+      if ('speechSynthesis' in window) {
+        const utterance = new SpeechSynthesisUtterance(text);
+        utterance.lang = language === 'en' ? 'en-US' : 'en-US';
+        utterance.rate = ttsSpeed;
+        window.speechSynthesis.cancel();
+        window.speechSynthesis.speak(utterance);
+        utterance.onend = () => setTtsPlaying(false);
+        setTtsPlaying(true);
+      } else {
+        toast("TTS failed");
+        console.error(e);
+      }
     }
   }
 
@@ -434,7 +366,6 @@ export default function AdminDashboard() {
     try {
       if (audioRef.current) {
         if (!audioRef.current.paused) {
-          // Pause the audio and store state for resuming
           audioRef.current.pause();
           setPausedTime(audioRef.current.currentTime);
           if (lastAudioUrlRef.current) {
@@ -442,39 +373,21 @@ export default function AdminDashboard() {
           }
           setTtsPlaying(false);
         } else {
-          // Resume the audio
           audioRef.current.play();
           setTtsPlaying(true);
         }
         return;
       }
-
-      // If no audio ref but we have paused state, try to resume
-      if (pausedAudioUrl && pausedTime > 0) {
-        const a = new Audio(pausedAudioUrl);
-        audioRef.current = a;
-        a.currentTime = pausedTime;
-        a.onended = () => {
-          cleanupAudio();
-          setTtsPlaying(false);
-        };
-        a.play();
-        setTtsPlaying(true);
-        return;
-      }
-
-      // fallback: pause any <audio> elements that are in the DOM
-      const audioElements = document.querySelectorAll('audio');
-      let foundPlaying = false;
-      audioElements.forEach(audio => {
-        if (!audio.paused) {
-          audio.pause();
-          foundPlaying = true;
-        }
-      });
       
-      if (foundPlaying) {
-        setTtsPlaying(false);
+      // Fallback for speech synthesis
+      if ('speechSynthesis' in window) {
+        if (window.speechSynthesis.speaking && !window.speechSynthesis.paused) {
+          window.speechSynthesis.pause();
+          setTtsPlaying(false);
+        } else if (window.speechSynthesis.paused) {
+          window.speechSynthesis.resume();
+          setTtsPlaying(true);
+        }
       }
     } catch (e) {
       console.error("Error in pauseResumeTTS:", e);
@@ -483,16 +396,9 @@ export default function AdminDashboard() {
 
   function stopTTS() {
     cleanupAudio();
-    setTtsPlaying(false);
-    
-    // fallback: stop any <audio> elements that are in the DOM
-    const audioElements = document.querySelectorAll('audio');
-    audioElements.forEach(audio => {
-      try { 
-        (audio as HTMLAudioElement).pause(); 
-        (audio as HTMLAudioElement).currentTime = 0; 
-      } catch {}
-    });
+    if ('speechSynthesis' in window) {
+      window.speechSynthesis.cancel();
+    }
   }
 
   // ---------- File handlers ----------
@@ -502,11 +408,13 @@ export default function AdminDashboard() {
     setIsDragging(false);
     const dropped = Array.from(e.dataTransfer.files || []).filter(isPDF);
     if (dropped.length) setFiles((prev) => dedupe([...prev, ...dropped]));
+    setUploadError(null);
   };
 
   const onPick = (e: React.ChangeEvent<HTMLInputElement>) => {
     const picked = Array.from(e.target.files || []).filter(isPDF);
     if (picked.length) setFiles((prev) => dedupe([...prev, ...picked]));
+    setUploadError(null);
   };
 
   const removeFile = (name: string) => setFiles((prev) => prev.filter((f) => f.name !== name));
@@ -514,8 +422,14 @@ export default function AdminDashboard() {
 
   // ---------- Upload API ----------
   const handleIngest = async () => {
-    if (files.length === 0) return toast("Please choose at least one PDF.");
-    if (!dataset.trim()) return toast("Please enter a dataset name.");
+    if (files.length === 0) {
+      toast("Please choose at least one PDF.");
+      return;
+    }
+    if (!dataset.trim()) {
+      toast("Please enter a dataset name.");
+      return;
+    }
 
     const token = localStorage.getItem("admin_token");
     if (!token || !verifyAdminToken(token)) {
@@ -531,6 +445,7 @@ export default function AdminDashboard() {
     try {
       setIngesting(true);
       setUploadMessage("");
+      setUploadError(null);
 
       const res = await fetch(`${API_BASE}/admin/upload`, {
         method: "POST",
@@ -548,13 +463,13 @@ export default function AdminDashboard() {
 
       if (!res.ok) {
         const errorText = await safeText(res);
-        setUploadMessage(`Upload failed: ${errorText}`);
-        toast("Upload failed");
+        setUploadError(errorText);
+        toast(`Upload failed: ${errorText}`);
         return;
       }
 
       const data = await res.json();
-      const message = `Uploaded to ${data.dataset} — ${data.chunks_indexed} chunks indexed`;
+      const message = `✅ Uploaded to "${data.dataset}" — ${data.chunks_indexed} chunks indexed from ${data.documents_added} files`;
       setUploadMessage(message);
       toast(message);
 
@@ -562,9 +477,10 @@ export default function AdminDashboard() {
       fetchDatasets();
       fetchUploadedFiles();
       setFiles([]);
+      setDataset("");
     } catch (err: unknown) {
       const errorMsg = errorMessage(err) || "Failed to upload PDFs";
-      setUploadMessage(`Error: ${errorMsg}`);
+      setUploadError(errorMsg);
       toast(errorMsg);
     } finally {
       setIngesting(false);
@@ -576,9 +492,6 @@ export default function AdminDashboard() {
     const q = question.trim();
     if (!q) return toast("Type or dictate a question first.");
     
-    // Add model info to the user message
-    const selectedModelInfo = availableModels.find(m => m.id === selectedModel);
-    
     setMessages((prev) => [...prev, { 
       id: uid(), 
       role: "user", 
@@ -589,12 +502,6 @@ export default function AdminDashboard() {
     setQuestion("");
     try {
       setAsking(true);
-      
-      // Check if selected model is available
-      const modelInfo = availableModels.find(m => m.id === selectedModel);
-      if (!modelInfo?.available) {
-        throw new Error(`Model ${modelInfo?.name} is currently unavailable`);
-      }
 
       const res = await fetch(`${API_BASE}/ask`, {
         method: "POST",
@@ -604,23 +511,19 @@ export default function AdminDashboard() {
           top_k: 4, 
           language, 
           dataset: dataset || undefined,
-          model: selectedModel
+          retrieval_model: selectedModel
         }),
       });
       
       if (!res.ok) throw new Error(await safeText(res));
       const data = (await res.json()) as AskResponse;
       
-      // Add model info to assistant message
       setMessages((prev) => [...prev, { 
         id: uid(), 
         role: "assistant", 
         text: data.answer || "(no answer)",
         model: selectedModel
       }]);
-
-      // Log the interaction with model info
-      logInteraction(q, data.answer || "(no answer)", selectedModel);
       
     } catch (err: unknown) {
       const errorMsg = errorMessage(err) || "Failed to ask";
@@ -633,35 +536,10 @@ export default function AdminDashboard() {
           model: selectedModel
         },
       ]);
-      
-      // Log the error with model info
-      logInteraction(q, `Error: ${errorMsg}`, selectedModel);
     } finally {
       setAsking(false);
     }
   };
-
-  // ---------- Logging Function ----------
-  async function logInteraction(question: string, answer: string, modelUsed: string) {
-    try {
-      // Log to the backend if available
-      await fetch(`${API_BASE}/admin/log-interaction`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", ...getAuthHeaders() },
-        body: JSON.stringify({
-          question,
-          answer,
-          dataset: dataset || null,
-          language,
-          model_used: modelUsed,
-          timestamp: new Date().toISOString()
-        }),
-      });
-    } catch (e) {
-      console.error("Failed to log interaction:", e);
-      // If backend logging fails, we'll still show it in the frontend logs
-    }
-  }
 
   // ---------- Feedback ----------
   async function handleFeedback(messageId: string, feedback: 'good' | 'bad' | 'no_response') {
@@ -681,7 +559,7 @@ export default function AdminDashboard() {
           feedback,
           question: message.role === 'user' ? message.text : undefined,
           answer: message.role === 'assistant' ? message.text : undefined,
-          model_used: message.model,
+          model_used: message.model || selectedModel,
           timestamp: new Date().toISOString()
         }),
       });
@@ -692,7 +570,6 @@ export default function AdminDashboard() {
       }[feedback];
       toast(`Feedback recorded: ${feedbackText}`);
       
-      // Refresh feedback logs if we're on that tab
       if (tab === 'feedback') {
         fetchFeedbackLogs();
       }
@@ -750,8 +627,8 @@ export default function AdminDashboard() {
       const result = await res.json();
       
       toast(`✅ Deleted "${filename}" (${result.chunks_removed} chunks removed)`);
-      fetchUploadedFiles(); // Refresh the list
-      fetchDatasets(); // Refresh datasets in case this was the last file in a dataset
+      fetchUploadedFiles();
+      fetchDatasets();
     } catch (e: any) {
       toast(`❌ Failed to delete file: ${e.message}`);
       console.error(e);
@@ -777,9 +654,9 @@ export default function AdminDashboard() {
       
       const result = await res.json();
       
-      toast(`✅ Deleted dataset "${datasetName}" (${result.chunks_removed} chunks from ${result.files_affected.length} files)`);
-      fetchUploadedFiles(); // Refresh the list
-      fetchDatasets(); // Refresh datasets list
+      toast(`✅ Deleted dataset "${datasetName}" (${result.chunks_removed} chunks removed)`);
+      fetchUploadedFiles();
+      fetchDatasets();
     } catch (e: any) {
       toast(`❌ Failed to delete dataset: ${e.message}`);
       console.error(e);
@@ -813,14 +690,8 @@ export default function AdminDashboard() {
       }
       if (!res.ok) {
         console.error("Failed to fetch logs:", await res.text());
-        // For demo purposes, create mock logs with model info
-        const mockLogs = generateMockLogs();
-        setLogs(mockLogs);
-        if (mockLogs.length > 0) {
-          setSelectedLog(mockLogs[0]);
-        } else {
-          setSelectedLog(null);
-        }
+        setLogs([]);
+        setSelectedLog(null);
         return;
       }
       const j = await res.json();
@@ -832,54 +703,11 @@ export default function AdminDashboard() {
       }
     } catch (e) {
       console.error("fetchLogs error:", e);
-      // For demo purposes, create mock logs with model info
-      const mockLogs = generateMockLogs();
-      setLogs(mockLogs);
-      if (mockLogs.length > 0) {
-        setSelectedLog(mockLogs[0]);
-      } else {
-        setSelectedLog(null);
-      }
+      setLogs([]);
+      setSelectedLog(null);
     } finally {
       setLoadingLogs(false);
     }
-  }
-
-  // Generate mock logs for demo purposes
-  function generateMockLogs(): LogRow[] {
-    const models = MOCK_AI_MODELS.filter(m => m.available).map(m => m.id);
-    const questions = [
-      "What are the eligibility criteria for MSME registration?",
-      "How can I apply for a business loan?",
-      "What documents are needed for export license?",
-      "Tell me about government subsidies for small businesses",
-      "How to register a new manufacturing unit?",
-      "What is the process for GST registration?",
-      "Are there any tax benefits for startups?",
-      "How to get quality certification for my products?"
-    ];
-    
-    const answers = [
-      "Based on the MSME documents, the eligibility criteria depend on investment in plant and machinery...",
-      "The application process for business loans involves submitting your business plan, financial statements...",
-      "For export license, you typically need company registration documents, IEC code, and proof of business...",
-      "Government subsidies are available under various schemes like Credit Linked Capital Subsidy...",
-      "Registering a manufacturing unit requires approval from the District Industries Center...",
-      "GST registration can be completed online through the GST portal with required documents...",
-      "Yes, startups can avail tax benefits under Section 80-IAC of Income Tax Act for eligible businesses...",
-      "Quality certification processes vary by product type but generally involve BIS or ISO certifications..."
-    ];
-
-    return Array.from({ length: 15 }, (_, i) => ({
-      id: i + 1,
-      question: questions[i % questions.length],
-      answer: answers[i % answers.length],
-      dataset: i % 3 === 0 ? "msme-schemes" : i % 3 === 1 ? "business-regulations" : "export-policies",
-      language: i % 4 === 0 ? "en" : i % 4 === 1 ? "hi" : i % 4 === 2 ? "te" : "ta",
-      model_used: models[i % models.length],
-      created_at: new Date(Date.now() - i * 3600000).toISOString(),
-      feedback: i % 5 === 0 ? 'good' : i % 5 === 1 ? 'bad' : i % 5 === 2 ? 'no_response' : undefined
-    }));
   }
 
   function pickLog(l: LogRow) {
@@ -909,15 +737,7 @@ export default function AdminDashboard() {
       
       if (!res.ok) {
         console.error("Failed to fetch feedback logs:", await res.text());
-        // For demo purposes, create mock feedback logs
-        const mockFeedbackLogs = generateMockFeedbackLogs();
-        setFeedbackLogs(mockFeedbackLogs);
-        setFeedbackStats({
-          total: mockFeedbackLogs.length,
-          good: mockFeedbackLogs.filter(f => f.feedback_type === 'good').length,
-          bad: mockFeedbackLogs.filter(f => f.feedback_type === 'bad').length,
-          no_response: mockFeedbackLogs.filter(f => f.feedback_type === 'no_response').length
-        });
+        setFeedbackLogs([]);
         return;
       }
       
@@ -926,54 +746,10 @@ export default function AdminDashboard() {
       setFeedbackStats(data.summary || { total: 0, good: 0, bad: 0, no_response: 0 });
     } catch (e) {
       console.error("fetchFeedbackLogs error:", e);
-      // For demo purposes, create mock feedback logs
-      const mockFeedbackLogs = generateMockFeedbackLogs();
-      setFeedbackLogs(mockFeedbackLogs);
-      setFeedbackStats({
-        total: mockFeedbackLogs.length,
-        good: mockFeedbackLogs.filter(f => f.feedback_type === 'good').length,
-        bad: mockFeedbackLogs.filter(f => f.feedback_type === 'bad').length,
-        no_response: mockFeedbackLogs.filter(f => f.feedback_type === 'no_response').length
-      });
+      setFeedbackLogs([]);
     } finally {
       setLoadingFeedback(false);
     }
-  }
-
-  // Generate mock feedback logs for demo purposes
-  function generateMockFeedbackLogs(): FeedbackLog[] {
-    const models = MOCK_AI_MODELS.filter(m => m.available).map(m => m.id);
-    const questions = [
-      "What are the eligibility criteria for MSME registration?",
-      "How can I apply for a business loan?",
-      "What documents are needed for export license?",
-      "Tell me about government subsidies for small businesses"
-    ];
-    
-    const answers = [
-      "Based on the MSME documents, the eligibility criteria depend on investment...",
-      "The application process for business loans involves submitting your business plan...",
-      "For export license, you typically need company registration documents...",
-      "Government subsidies are available under various schemes..."
-    ];
-
-    return Array.from({ length: 25 }, (_, i) => {
-      const feedbackType = i % 5 === 0 ? 'good' : i % 5 === 1 ? 'bad' : 'no_response';
-      const hasContent = feedbackType !== 'no_response';
-      
-      return {
-        id: i + 1,
-        message_id: `msg_${i + 1}`,
-        feedback_type: feedbackType as 'good' | 'bad' | 'no_response',
-        question: hasContent ? questions[i % questions.length] : undefined,
-        answer: hasContent ? answers[i % answers.length] : undefined,
-        dataset: i % 3 === 0 ? "msme-schemes" : i % 3 === 1 ? "business-regulations" : "export-policies",
-        language: i % 4 === 0 ? "en" : i % 4 === 1 ? "hi" : i % 4 === 2 ? "te" : "ta",
-        model_used: models[i % models.length],
-        timestamp: new Date(Date.now() - i * 86400000).toISOString(),
-        created_at: new Date(Date.now() - i * 86400000).toISOString()
-      };
-    });
   }
 
   async function fetchFeedbackStats() {
@@ -986,38 +762,10 @@ export default function AdminDashboard() {
       if (res.ok) {
         const data = await res.json();
         setDailyTrends(data.daily_trends || []);
-      } else {
-        // Mock daily trends for demo
-        const mockTrends = generateMockDailyTrends();
-        setDailyTrends(mockTrends);
       }
     } catch (e) {
       console.error("fetchFeedbackStats error:", e);
-      // Mock daily trends for demo
-      const mockTrends = generateMockDailyTrends();
-      setDailyTrends(mockTrends);
     }
-  }
-
-  // Generate mock daily trends for demo
-  function generateMockDailyTrends(): DailyTrend[] {
-    return Array.from({ length: 30 }, (_, i) => {
-      const date = new Date();
-      date.setDate(date.getDate() - (29 - i));
-      
-      const good = Math.floor(Math.random() * 10) + 5;
-      const bad = Math.floor(Math.random() * 5) + 1;
-      const no_response = Math.floor(Math.random() * 3) + 1;
-      const total = good + bad + no_response;
-      
-      return {
-        date: date.toISOString().split('T')[0],
-        good,
-        bad,
-        no_response,
-        total
-      };
-    });
   }
 
   function getFeedbackIcon(feedbackType: string) {
@@ -1040,26 +788,17 @@ export default function AdminDashboard() {
 
   // ---------- STT helpers ----------
   function sttLocale(code: LangCode): string {
-    // Browser Speech Recognition has limited language support
     const supportedMap: Record<LangCode, string> = {
       "en": "en-US",
-      "hi": "hi-IN",    // Hindi - supported in Chrome
-      "te": "en-US",    // Telugu - not widely supported
-      "ta": "en-US",    // Tamil - not widely supported  
-      "mr": "en-US",    // Marathi - not widely supported
-      "kn": "en-US",    // Kannada - not widely supported
-      "ml": "en-US",    // Malayalam - not widely supported
-      "bn": "en-US"     // Bengali - not widely supported
+      "hi": "hi-IN",
+      "te": "en-US",
+      "ta": "en-US",  
+      "mr": "en-US",
+      "kn": "en-US",
+      "ml": "en-US",
+      "bn": "en-US"
     };
-    
-    const locale = supportedMap[code];
-    
-    // Show warning for unsupported languages
-    if (locale === "en-US" && code !== "en") {
-      console.warn(`Browser STT doesn't support ${code}, falling back to English`);
-    }
-    
-    return locale;
+    return supportedMap[code];
   }
 
   function getSpeechRecognitionCtor(): SRConstructor | null {
@@ -1076,7 +815,6 @@ export default function AdminDashboard() {
       return;
     }
 
-    // Check if the language is supported by browser STT
     const isSupported = ["en", "hi"].includes(language);
     if (!isSupported) {
       toast(`${getLanguageName(language)} not supported in browser STT. Using server STT.`);
@@ -1209,15 +947,24 @@ export default function AdminDashboard() {
     }
   }
 
+  async function toggleRecording() {
+    if (recording) {
+      if (useBrowserSTT) stopBrowserSTT();
+      else stopServerRecording();
+    } else {
+      if (useBrowserSTT) startBrowserSTT();
+      else startServerRecording();
+    }
+  }
+
   const disabled = ingesting || asking;
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-50 via-blue-50 to-indigo-50 flex flex-col overflow-hidden">
-      {/* Header - MSME Branded Design */}
+      {/* Header */}
       <header className="sticky top-0 z-50 backdrop-blur-lg bg-white/90 border-b border-white/20 shadow-sm">
         <div className="mx-auto max-w-7xl px-6 py-4 flex items-center justify-between">
           <div className="flex items-center gap-4">
-            {/* MSME Logo */}
             <div className="flex items-center gap-3">
               <div className="h-12 w-12 bg-gradient-to-r from-blue-600 to-blue-800 rounded-xl flex items-center justify-center text-white font-bold text-lg">
                 MSME
@@ -1256,6 +1003,10 @@ export default function AdminDashboard() {
           </div>
 
           <div className="flex items-center gap-3">
+            <div className="flex items-center gap-2 text-xs px-3 py-2 rounded-full border border-blue-200 bg-white/80 text-gray-600">
+              <div className={`w-2 h-2 rounded-full animate-pulse ${backendHealth ? 'bg-green-500' : 'bg-red-500'}`}></div>
+              {backendHealth ? 'Connected' : 'Disconnected'}
+            </div>
             <button 
               onClick={() => router.push("/")} 
               className="px-4 py-2 rounded-xl border border-blue-300 bg-white text-gray-700 hover:bg-blue-50 transition-all duration-200 text-sm font-medium"
@@ -1286,14 +1037,14 @@ export default function AdminDashboard() {
               <h2 className="text-xl font-bold bg-gradient-to-r from-gray-800 to-gray-600 bg-clip-text text-transparent mb-4">
                 Upload & Index PDFs
               </h2>
-              <p className="text-sm text-gray-600 mb-6">Drop files below or click to select. Only PDFs are accepted.</p>
+              <p className="text-sm text-gray-600 mb-6">Drop PDF files below or click to select. Only PDFs are accepted.</p>
 
               <div className="mb-6">
                 <label className="block text-sm font-medium text-gray-700 mb-3">Dataset Name</label>
                 <input
                   value={dataset}
                   onChange={(e) => setDataset(e.target.value)}
-                  placeholder="Enter dataset name..."
+                  placeholder="Enter dataset name (e.g., msme-schemes, business-regulations)"
                   className="w-full border border-gray-200 rounded-2xl px-4 py-3 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent bg-white/50 backdrop-blur-sm font-medium"
                 />
               </div>
@@ -1360,8 +1111,13 @@ export default function AdminDashboard() {
               </div>
 
               {uploadMessage && (
-                <div className="mt-4 p-4 bg-blue-50 border border-blue-200 rounded-2xl text-sm text-blue-700">
+                <div className="mt-4 p-4 bg-green-50 border border-green-200 rounded-2xl text-sm text-green-700">
                   {uploadMessage}
+                </div>
+              )}
+              {uploadError && (
+                <div className="mt-4 p-4 bg-red-50 border border-red-200 rounded-2xl text-sm text-red-700">
+                  Error: {uploadError}
                 </div>
               )}
             </div>
@@ -1389,11 +1145,16 @@ export default function AdminDashboard() {
 
         {tab === "chat" && (
           <section className="grid gap-6">
-            {/* Chat Display Area */}
             <div className="rounded-3xl backdrop-blur-lg bg-white/80 border border-white/50 shadow-2xl p-6">
-              <h2 className="text-xl font-bold bg-gradient-to-r from-gray-800 to-gray-600 bg-clip-text text-transparent mb-4">
-                Admin Chat Interface
-              </h2>
+              <div className="flex items-center justify-between mb-4">
+                <h2 className="text-xl font-bold bg-gradient-to-r from-gray-800 to-gray-600 bg-clip-text text-transparent">
+                  Admin Chat Interface
+                </h2>
+                <div className="flex items-center gap-2 px-3 py-1.5 bg-blue-50 rounded-full">
+                  <span className="text-lg">🌟</span>
+                  <span className="text-sm font-medium text-blue-700">Google Gemini AI</span>
+                </div>
+              </div>
               
               <div className="rounded-2xl border border-gray-200 bg-white/50 backdrop-blur-sm p-4 mb-6">
                 <div 
@@ -1401,32 +1162,28 @@ export default function AdminDashboard() {
                   className="h-96 overflow-y-auto scrollbar-thin scrollbar-thumb-blue-200 scrollbar-track-blue-50 hover:scrollbar-thumb-blue-300"
                 >
                   <div className="space-y-4 p-2">
-                    {messages.map((m, index) => (
+                    {messages.filter(m => m.role !== 'system').map((m, index) => (
                       <div 
                         key={m.id} 
                         className={`flex ${m.role === "user" ? "justify-end" : "justify-start"} animate-fade-in`}
-                        style={{ animationDelay: `${index * 100}ms` }}
                       >
                         <div
-                          className={`group max-w-[85%] px-4 py-3 leading-relaxed whitespace-pre-wrap rounded-2xl shadow-lg backdrop-blur-sm border transform transition-all duration-300 ${
+                          className={`group max-w-[85%] px-4 py-3 leading-relaxed whitespace-pre-wrap rounded-2xl shadow-lg backdrop-blur-sm border ${
                             m.role === "user" 
                               ? "bg-gradient-to-br from-blue-600 to-indigo-600 text-white rounded-br-md" 
                               : "bg-white/90 text-gray-800 rounded-bl-md border-gray-100"
                           }`}
                         >
-                          {/* Add model indicator for assistant messages */}
-                          {m.role === "assistant" && m.model && (
+                          {m.role === "assistant" && (
                             <div className="flex items-center gap-2 mb-2 text-xs">
                               <span className="px-2 py-1 bg-blue-100 text-blue-700 rounded-full font-medium">
-                                {availableModels.find(model => model.id === m.model)?.icon} 
-                                {availableModels.find(model => model.id === m.model)?.provider}
+                                🌟 Gemini AI
                               </span>
                             </div>
                           )}
                           
                           <div className="text-sm">{m.text}</div>
                           
-                          {/* Assistant Actions with Feedback */}
                           {m.role === "assistant" && (
                             <div className="mt-3 flex flex-wrap items-center gap-2">
                               <div className="flex gap-2 opacity-0 group-hover:opacity-100 transition-opacity duration-300">
@@ -1462,7 +1219,6 @@ export default function AdminDashboard() {
                                 </button>
                               </div>
 
-                              {/* Feedback Buttons */}
                               <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity duration-300">
                                 <div className="h-3 w-px bg-gray-300 mx-2"></div>
                                 <span className="text-xs text-gray-500 font-medium mr-1">Helpful?</span>
@@ -1473,7 +1229,7 @@ export default function AdminDashboard() {
                                       ? 'bg-green-100 text-green-600 border border-green-200 shadow-sm' 
                                       : 'bg-white text-gray-400 hover:text-green-500 hover:bg-green-50 border border-gray-200 hover:border-green-200'
                                   }`}
-                                  title="This answer was helpful"
+                                  title="Helpful"
                                 >
                                   <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 20 20">
                                     <path fillRule="evenodd" d="M14.707 12.707a1 1 0 01-1.414 0L10 9.414l-3.293 3.293a1 1 0 01-1.414-1.414l4-4a1 1 0 011.414 0l4 4a1 1 0 010 1.414z" clipRule="evenodd" />
@@ -1486,7 +1242,7 @@ export default function AdminDashboard() {
                                       ? 'bg-red-100 text-red-600 border border-red-200 shadow-sm' 
                                       : 'bg-white text-gray-400 hover:text-red-500 hover:bg-red-50 border border-gray-200 hover:border-red-200'
                                   }`}
-                                  title="This answer was not helpful"
+                                  title="Not Helpful"
                                 >
                                   <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 20 20">
                                     <path fillRule="evenodd" d="M5.293 7.293a1 1 0 011.414 0L10 10.586l3.293-3.293a1 1 0 111.414 1.414l-4 4a1 1 0 01-1.414 0l-4-4a1 1 0 010-1.414z" clipRule="evenodd" />
@@ -1499,7 +1255,7 @@ export default function AdminDashboard() {
                                       ? 'bg-yellow-100 text-yellow-600 border border-yellow-200 shadow-sm' 
                                       : 'bg-white text-gray-400 hover:text-yellow-500 hover:bg-yellow-50 border border-gray-200 hover:border-yellow-200'
                                   }`}
-                                  title="No response needed"
+                                  title="No Response"
                                 >
                                   <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 9v6m4-6v6m7-3a9 9 0 11-18 0 9 9 0 0118 0z" />
@@ -1521,7 +1277,7 @@ export default function AdminDashboard() {
                               <div className="w-2 h-2 bg-blue-500 rounded-full animate-bounce" style={{animationDelay: '0.1s'}}></div>
                               <div className="w-2 h-2 bg-blue-500 rounded-full animate-bounce" style={{animationDelay: '0.2s'}}></div>
                             </div>
-                            <div className="text-sm font-medium">Analyzing your question...</div>
+                            <div className="text-sm font-medium">Analyzing your question with Gemini...</div>
                           </div>
                         </div>
                       </div>
@@ -1534,26 +1290,6 @@ export default function AdminDashboard() {
               {/* Input Area */}
               <div className="space-y-4">
                 <div className="flex flex-wrap items-center gap-4 text-sm">
-                  {/* AI Model Selection */}
-                  <label className="flex items-center gap-2 font-medium text-gray-700">
-                    <span>AI Model:</span>
-                    <select 
-                      value={selectedModel} 
-                      onChange={(e) => setSelectedModel(e.target.value)} 
-                      className="border border-gray-200 rounded-xl px-3 py-2 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent font-medium"
-                    >
-                      {availableModels.map((model) => (
-                        <option 
-                          key={model.id} 
-                          value={model.id}
-                          disabled={!model.available}
-                        >
-                          {model.icon} {model.name} {!model.available ? '(Unavailable)' : ''}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-
                   <label className="flex items-center gap-2 font-medium text-gray-700">
                     <span>Answer language:</span>
                     <select 
@@ -1594,10 +1330,9 @@ export default function AdminDashboard() {
                       className="rounded text-blue-600 focus:ring-blue-500 w-4 h-4"
                     />
                     <span>Browser Speech Recognition</span>
-                    <span className="text-xs text-gray-500">(Only EN, HI supported)</span>
+                    <span className="text-xs text-gray-500">(EN, HI only)</span>
                   </label>
 
-                  {/* TTS Speed Control */}
                   <label className="flex items-center gap-2 font-medium text-gray-700">
                     <span>TTS Speed:</span>
                     <select 
@@ -1605,12 +1340,12 @@ export default function AdminDashboard() {
                       onChange={(e) => setTtsSpeed(parseFloat(e.target.value))} 
                       className="border border-gray-200 rounded-xl px-3 py-2 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent font-medium"
                     >
-                      <option value="0.5">0.5x Slow</option>
+                      <option value="0.5">0.5x</option>
                       <option value="0.75">0.75x</option>
-                      <option value="1.0">1.0x Normal</option>
+                      <option value="1.0">1.0x</option>
                       <option value="1.25">1.25x</option>
-                      <option value="1.5">1.5x Fast</option>
-                      <option value="2.0">2.0x Very Fast</option>
+                      <option value="1.5">1.5x</option>
+                      <option value="2.0">2.0x</option>
                     </select>
                   </label>
                 </div>
@@ -1626,7 +1361,7 @@ export default function AdminDashboard() {
                     />
                     <div className="absolute right-3 top-1/2 transform -translate-y-1/2 flex items-center gap-2">
                       <button
-                        onClick={() => { if (recording) { useBrowserSTT ? stopBrowserSTT() : stopServerRecording(); } else { useBrowserSTT ? startBrowserSTT() : startServerRecording(); } }}
+                        onClick={toggleRecording}
                         title={recording ? "Stop recording" : "Start recording"}
                         className={`p-2.5 rounded-xl border transition-all duration-200 ${
                           recording 
@@ -1701,18 +1436,8 @@ export default function AdminDashboard() {
                       <div className="text-sm font-medium text-gray-800 truncate mb-1">{l.question}</div>
                       <div className="flex items-center justify-between text-xs text-gray-400">
                         <span>
-                          {l.dataset ?? "(All datasets)"} • {l.language ?? "en"}
-                          {l.model_used && ` • ${l.model_used.toUpperCase()}`}
+                          {l.dataset ?? "(All)"} • {l.language ?? "en"}
                         </span>
-                        {l.feedback && (
-                          <span className={`px-1.5 py-0.5 rounded-full text-xs ${
-                            l.feedback === 'good' ? 'bg-green-100 text-green-700' : 
-                            l.feedback === 'bad' ? 'bg-red-100 text-red-700' : 
-                            'bg-yellow-100 text-yellow-700'
-                          }`}>
-                            {l.feedback === 'good' ? '👍' : l.feedback === 'bad' ? '👎' : '⏸️'}
-                          </span>
-                        )}
                       </div>
                     </li>
                   ))}
@@ -1754,23 +1479,9 @@ export default function AdminDashboard() {
                     <div>
                       <span className="font-medium">Model:</span> 
                       <span className="ml-2 px-2 py-1 bg-blue-100 text-blue-700 rounded-full text-xs font-medium">
-                        {selectedLog.model_used ? selectedLog.model_used.toUpperCase() : "OpenAI"}
+                        Gemini AI
                       </span>
                     </div>
-                    {selectedLog.feedback && (
-                      <div>
-                        <span className="font-medium">Feedback:</span> 
-                        <span className={`ml-2 px-2 py-1 rounded-full text-xs ${
-                          selectedLog.feedback === 'good' ? 'bg-green-100 text-green-700' : 
-                          selectedLog.feedback === 'bad' ? 'bg-red-100 text-red-700' : 
-                          'bg-yellow-100 text-yellow-700'
-                        }`}>
-                          {selectedLog.feedback === 'good' ? 'Helpful 👍' : 
-                           selectedLog.feedback === 'bad' ? 'Not Helpful 👎' : 
-                           'No Response ⏸️'}
-                        </span>
-                      </div>
-                    )}
                   </div>
                 </div>
               )}
@@ -1799,7 +1510,7 @@ export default function AdminDashboard() {
                 <div className="w-6 h-6 border-2 border-blue-600 border-t-transparent rounded-full animate-spin"></div>
               </div>
             ) : uploadedFiles.length === 0 ? (
-              <p className="text-sm text-gray-500 text-center py-8">No files uploaded yet.</p>
+              <p className="text-sm text-gray-500 text-center py-8">No files uploaded yet. Go to Upload tab to add PDFs.</p>
             ) : (
               <div className="space-y-4 max-h-96 overflow-auto">
                 {uploadedFiles.map((file) => (
@@ -1816,18 +1527,11 @@ export default function AdminDashboard() {
                             <span className="text-amber-600 font-medium">OCR Used</span>
                           </>
                         )}
-                        {file.admin_username && (
-                          <>
-                            <span>•</span>
-                            <span>Uploaded by: <span className="font-medium">{file.admin_username}</span></span>
-                          </>
-                        )}
                       </div>
                     </div>
                     <button
                       onClick={() => deleteFile(file.filename)}
                       className="ml-4 px-4 py-2 text-sm bg-red-100 text-red-700 rounded-xl hover:bg-red-200 transition-all duration-200 font-medium whitespace-nowrap"
-                      title={`Delete ${file.filename}`}
                     >
                       Delete File
                     </button>
@@ -1836,7 +1540,6 @@ export default function AdminDashboard() {
               </div>
             )}
 
-            {/* Dataset Management Section */}
             <div className="mt-8 pt-6 border-t border-gray-200">
               <h3 className="text-lg font-bold text-gray-800 mb-4">Dataset Management</h3>
               <div className="space-y-3">
@@ -1856,7 +1559,6 @@ export default function AdminDashboard() {
                         onClick={() => deleteDataset(datasetName)}
                         className="ml-4 px-4 py-2 text-sm bg-red-100 text-red-700 rounded-xl hover:bg-red-200 transition-all duration-200 font-medium"
                         disabled={datasetFiles.length === 0}
-                        title={datasetFiles.length === 0 ? "No files in this dataset" : `Delete entire ${datasetName} dataset`}
                       >
                         Delete Dataset
                       </button>
@@ -1870,7 +1572,6 @@ export default function AdminDashboard() {
 
         {tab === "feedback" && (
           <section className="space-y-6">
-            {/* Feedback Stats Overview */}
             <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
               <div className="rounded-3xl backdrop-blur-lg bg-white/80 border border-white/50 shadow-2xl p-6">
                 <div className="flex items-center justify-between">
@@ -1921,7 +1622,6 @@ export default function AdminDashboard() {
               </div>
             </div>
 
-            {/* Feedback Logs Table */}
             <div className="rounded-3xl backdrop-blur-lg bg-white/80 border border-white/50 shadow-2xl p-6">
               <div className="flex items-center justify-between mb-6">
                 <h3 className="text-lg font-bold text-gray-800">Feedback Logs</h3>
@@ -1934,7 +1634,7 @@ export default function AdminDashboard() {
                     }}
                     className="border border-gray-200 rounded-xl px-3 py-2 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent text-sm"
                   >
-                    <option value="all">All Feedback</option>
+                    <option value="all">All</option>
                     <option value="good">Helpful 👍</option>
                     <option value="bad">Not Helpful 👎</option>
                     <option value="no_response">No Response ⏸️</option>
@@ -1967,8 +1667,7 @@ export default function AdminDashboard() {
                           <div>
                             <div className="font-semibold text-gray-800 capitalize">{log.feedback_type.replace('_', ' ')}</div>
                             <div className="text-xs text-gray-500">
-                              {new Date(log.timestamp).toLocaleString()} • Message ID: {log.message_id}
-                              {log.model_used && ` • Model: ${log.model_used.toUpperCase()}`}
+                              {new Date(log.timestamp).toLocaleString()}
                             </div>
                           </div>
                         </div>
@@ -1979,61 +1678,40 @@ export default function AdminDashboard() {
                         </span>
                       </div>
                       
-                      <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm">
-                        {log.question && (
-                          <div>
-                            <div className="font-medium text-gray-700 mb-1">Question:</div>
-                            <div className="text-gray-600 bg-gray-50 rounded-xl p-3">{log.question}</div>
-                          </div>
-                        )}
-                        {log.answer && (
-                          <div>
-                            <div className="font-medium text-gray-700 mb-1">Answer:</div>
-                            <div className="text-gray-600 bg-gray-50 rounded-xl p-3">{log.answer}</div>
-                          </div>
-                        )}
-                      </div>
-                      
-                      <div className="flex gap-4 mt-3 text-xs text-gray-500">
-                        {log.dataset && (
-                          <span>Dataset: <span className="font-medium">{log.dataset}</span></span>
-                        )}
-                        {log.language && (
-                          <span>Language: <span className="font-medium">{getLanguageName(log.language as LangCode)}</span></span>
-                        )}
-                        {log.model_used && (
-                          <span>Model: <span className="font-medium">{log.model_used.toUpperCase()}</span></span>
-                        )}
-                      </div>
+                      {log.question && (
+                        <div className="mt-2">
+                          <div className="font-medium text-gray-700 text-sm">Question:</div>
+                          <div className="text-gray-600 bg-gray-50 rounded-xl p-2 text-sm mt-1">{log.question}</div>
+                        </div>
+                      )}
+                      {log.answer && (
+                        <div className="mt-2">
+                          <div className="font-medium text-gray-700 text-sm">Answer:</div>
+                          <div className="text-gray-600 bg-gray-50 rounded-xl p-2 text-sm mt-1">{log.answer}</div>
+                        </div>
+                      )}
                     </div>
                   ))}
                 </div>
               )}
 
-              {/* Pagination */}
               {feedbackLogs.length > 0 && (
                 <div className="flex items-center justify-between mt-6 pt-6 border-t border-gray-200">
                   <div className="text-sm text-gray-500">
-                    Showing {feedbackOffset + 1} to {Math.min(feedbackOffset + feedbackLimit, feedbackStats.total)} of {feedbackStats.total} entries
+                    Showing {feedbackOffset + 1} to {Math.min(feedbackOffset + feedbackLimit, feedbackStats.total)} of {feedbackStats.total}
                   </div>
                   <div className="flex gap-2">
                     <button
-                      onClick={() => {
-                        const newOffset = Math.max(0, feedbackOffset - feedbackLimit);
-                        setFeedbackOffset(newOffset);
-                      }}
+                      onClick={() => setFeedbackOffset(Math.max(0, feedbackOffset - feedbackLimit))}
                       disabled={feedbackOffset === 0}
-                      className="px-3 py-2 rounded-xl border border-gray-300 bg-white text-gray-700 hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed transition-all duration-200 text-sm"
+                      className="px-3 py-2 rounded-xl border border-gray-300 bg-white text-gray-700 hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed text-sm"
                     >
                       Previous
                     </button>
                     <button
-                      onClick={() => {
-                        const newOffset = feedbackOffset + feedbackLimit;
-                        setFeedbackOffset(newOffset);
-                      }}
+                      onClick={() => setFeedbackOffset(feedbackOffset + feedbackLimit)}
                       disabled={feedbackOffset + feedbackLimit >= feedbackStats.total}
-                      className="px-3 py-2 rounded-xl border border-gray-300 bg-white text-gray-700 hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed transition-all duration-200 text-sm"
+                      className="px-3 py-2 rounded-xl border border-gray-300 bg-white text-gray-700 hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed text-sm"
                     >
                       Next
                     </button>
@@ -2041,64 +1719,6 @@ export default function AdminDashboard() {
                 </div>
               )}
             </div>
-
-            {/* Daily Trends Chart */}
-            {dailyTrends.length > 0 && (
-              <div className="rounded-3xl backdrop-blur-lg bg-white/80 border border-white/50 shadow-2xl p-6">
-                <h3 className="text-lg font-bold text-gray-800 mb-6">Feedback Trends (Last 30 Days)</h3>
-                <div className="space-y-4">
-                  {dailyTrends.slice(-7).map((trend) => (
-                    <div key={trend.date} className="flex items-center justify-between">
-                      <div className="text-sm font-medium text-gray-700 w-24">
-                        {new Date(trend.date).toLocaleDateString()}
-                      </div>
-                      <div className="flex-1 ml-4">
-                        <div className="flex h-6 rounded-full overflow-hidden">
-                          {trend.good > 0 && (
-                            <div 
-                              className="bg-green-500 transition-all duration-300"
-                              style={{ width: `${(trend.good / trend.total) * 100}%` }}
-                              title={`Helpful: ${trend.good}`}
-                            ></div>
-                          )}
-                          {trend.bad > 0 && (
-                            <div 
-                              className="bg-red-500 transition-all duration-300"
-                              style={{ width: `${(trend.bad / trend.total) * 100}%` }}
-                              title={`Not Helpful: ${trend.bad}`}
-                            ></div>
-                          )}
-                          {trend.no_response > 0 && (
-                            <div 
-                              className="bg-yellow-500 transition-all duration-300"
-                              style={{ width: `${(trend.no_response / trend.total) * 100}%` }}
-                              title={`No Response: ${trend.no_response}`}
-                            ></div>
-                          )}
-                        </div>
-                      </div>
-                      <div className="text-xs text-gray-500 w-16 text-right">
-                        {trend.total} total
-                      </div>
-                    </div>
-                  ))}
-                </div>
-                <div className="flex gap-4 mt-4 text-xs text-gray-500">
-                  <div className="flex items-center gap-1">
-                    <div className="w-3 h-3 bg-green-500 rounded"></div>
-                    <span>Helpful</span>
-                  </div>
-                  <div className="flex items-center gap-1">
-                    <div className="w-3 h-3 bg-red-500 rounded"></div>
-                    <span>Not Helpful</span>
-                  </div>
-                  <div className="flex items-center gap-1">
-                    <div className="w-3 h-3 bg-yellow-500 rounded"></div>
-                    <span>No Response</span>
-                  </div>
-                </div>
-              </div>
-            )}
           </section>
         )}
       </main>
@@ -2108,23 +1728,21 @@ export default function AdminDashboard() {
   );
 }
 
-// ---------- UI PRIMITIVES ----------
+// UI Components
 function CloudIcon() {
   return (
-    <svg width="48" height="48" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+    <svg width="48" height="48" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
       <path 
         d="M7 18H17C19.2091 18 21 16.2091 21 14C21 11.9848 19.5223 10.3184 17.5894 10.0458C16.9942 7.74078 14.9289 6 12.5 6C10.2387 6 8.30734 7.4246 7.65085 9.50138C5.61892 9.68047 4 11.3838 4 13.4375C4 15.6228 5.79086 17.5 8 17.5H7Z" 
         stroke="currentColor" 
         strokeWidth="1.5" 
-        strokeLinecap="round" 
-        strokeLinejoin="round"
+        fill="none"
         className="text-blue-500"
       />
     </svg>
   );
 }
 
-// ---------- Toasts ----------
 function Toaster() {
   const [items, setItems] = useState<{ id: string; text: string }[]>([]);
   useEffect(() => {
@@ -2141,7 +1759,7 @@ function Toaster() {
   return (
     <div className="fixed bottom-4 right-4 flex flex-col gap-2 z-50">
       {items.map((i) => (
-        <div key={i.id} className="px-4 py-3 rounded-xl bg-gradient-to-r from-blue-600 to-blue-700 text-white shadow-lg backdrop-blur-sm border border-white/20">
+        <div key={i.id} className="px-4 py-3 rounded-xl bg-gradient-to-r from-blue-600 to-blue-700 text-white shadow-lg">
           {i.text}
         </div>
       ))}
@@ -2155,11 +1773,14 @@ function toast(text: string) {
   }
 }
 
-// ---------- Helpers ----------
+// Helpers
 function uid() {
-  const g = typeof crypto !== "undefined" && typeof crypto.randomUUID === "function" ? (crypto as any).randomUUID() : undefined;
-  return g || `id_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  if (typeof crypto !== "undefined" && crypto.randomUUID) {
+    return crypto.randomUUID();
+  }
+  return `id_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 }
+
 function dedupe(list: File[]) {
   const seen = new Set<string>();
   const out: File[] = [];
@@ -2172,9 +1793,11 @@ function dedupe(list: File[]) {
   }
   return out;
 }
+
 function isPDF(f: File) {
   return f.type === "application/pdf" || f.name.toLowerCase().endsWith(".pdf");
 }
+
 async function safeText(res: Response) {
   try {
     return await res.text();
@@ -2182,6 +1805,7 @@ async function safeText(res: Response) {
     return `${res.status} ${res.statusText}`;
   }
 }
+
 function errorMessage(e: unknown): string | undefined {
   if (typeof e === "string") return e;
   if (e && typeof e === "object" && "message" in e) {

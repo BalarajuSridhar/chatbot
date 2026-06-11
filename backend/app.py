@@ -1,10 +1,10 @@
-# backend/app.py
 import os
 import io
 import uuid
 import logging
 from typing import Optional, List
 from datetime import datetime, timedelta
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Depends, Body, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -12,325 +12,91 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
-# SQLModel for dataset metadata + logs
-from sqlmodel import SQLModel, create_engine, Session, Field, select
+# Load environment variables
+load_dotenv()
 
-# vector / embedding / PDF
-import chromadb
-from chromadb.config import Settings
-import numpy as np
-from pypdf import PdfReader
+# Simple file-based storage for demo (replace with real DB for production)
+import json
+import sqlite3
 
-# Google Gemini API - USING NEW PACKAGE
-from google import genai
+# Create SQLite database
+conn = sqlite3.connect('/tmp/chatbot.db', check_same_thread=False)
+cursor = conn.cursor()
+cursor.execute('''
+    CREATE TABLE IF NOT EXISTS logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        question TEXT,
+        answer TEXT,
+        dataset TEXT,
+        language TEXT,
+        model_used TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+''')
+cursor.execute('''
+    CREATE TABLE IF NOT EXISTS feedback (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        message_id TEXT,
+        feedback_type TEXT,
+        question TEXT,
+        answer TEXT,
+        model_used TEXT,
+        timestamp TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+''')
+conn.commit()
 
-# Optional OCR + TTS fallbacks
+# Try to import Gemini
 try:
-    import pytesseract
-    from pdf2image import convert_from_bytes
-    OCR_AVAILABLE = True
-except Exception:
-    pytesseract = None
-    convert_from_bytes = None
-    OCR_AVAILABLE = False
+    import google.generativeai as genai
+    GEMINI_AVAILABLE = True
+except ImportError:
+    GEMINI_AVAILABLE = False
+    print("Warning: google.generativeai not installed")
 
+# Try to import sentence-transformers
 try:
-    from gtts import gTTS
-    GTTS_AVAILABLE = True
-except Exception:
-    gTTS = None
-    GTTS_AVAILABLE = False
+    from sentence_transformers import SentenceTransformer
+    import numpy as np
+    TRANSFORMERS_AVAILABLE = True
+except ImportError:
+    TRANSFORMERS_AVAILABLE = False
+    print("Warning: sentence-transformers not installed")
 
-# JWT + password context
-import jwt
-from passlib.context import CryptContext
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-load_dotenv(os.path.join(BASE_DIR, ".env"))
-
+# Configuration
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
-
-CHROMA_DIR = os.getenv("CHROMA_DIR", os.path.join(BASE_DIR, "chroma_data"))
-EMBED_MODEL_NAME = os.getenv("EMBED_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2")
-
-MAX_FILE_SIZE = 10 * 1024 * 1024
-MAX_CHUNKS = 1000
-
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
-
-JWT_SECRET = os.getenv("JWT_SECRET", "your-secret-key-change-this-in-production")
+JWT_SECRET = os.getenv("JWT_SECRET", "your-secret-key-change-this")
 JWT_ALGO = "HS256"
-JWT_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "1440"))
 
-if not GEMINI_API_KEY:
-    raise RuntimeError("GEMINI_API_KEY is required! Please set it in .env file or environment variables.")
+# Initialize Gemini if available
+if GEMINI_API_KEY and GEMINI_AVAILABLE:
+    genai.configure(api_key=GEMINI_API_KEY)
+    logger.info("Gemini API configured")
+else:
+    logger.warning("Gemini API not configured")
 
-# Initialize Gemini client with new API
-try:
-    genai_client = genai.Client(api_key=GEMINI_API_KEY)
-    logger = logging.getLogger("backend.app")
-    logger.info("✓ Gemini client initialized successfully")
-except Exception as e:
-    raise RuntimeError(f"Failed to initialize Gemini client: {e}")
+# Simple in-memory storage for demo (files uploaded to /tmp)
+UPLOAD_DIR = "/tmp/uploads"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# ---------------------------------------------------------------------
-# Logging & app
-# ---------------------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger("backend.app")
+# Store chunks in memory (for demo purposes)
+chunks_db = []
 
-app = FastAPI(title="PDF Q&A Chatbot with Gemini", version="1.0.0")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ---------------------------------------------------------------------
-# Database setup
-# ---------------------------------------------------------------------
-DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{os.path.join(BASE_DIR, 'backend.db')}")
-engine = create_engine(DATABASE_URL, echo=False)
-
-class DatasetMeta(SQLModel, table=True):
-    id: Optional[int] = Field(default=None, primary_key=True)
-    name: str
-    created_by: Optional[str] = None
-    version: int = 1
-    note: Optional[str] = None
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-
-class LoggedQuestion(SQLModel, table=True):
-    id: Optional[int] = Field(default=None, primary_key=True)
-    question: str
-    answer: Optional[str] = None
-    dataset: Optional[str] = None
-    language: Optional[str] = None
-    model_used: Optional[str] = None
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-
-class FeedbackLog(SQLModel, table=True):
-    id: Optional[int] = Field(default=None, primary_key=True)
-    message_id: str
-    feedback_type: str
-    question: Optional[str] = None
-    answer: Optional[str] = None
-    dataset: Optional[str] = None
-    language: Optional[str] = None
-    model_used: Optional[str] = None
-    timestamp: str
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-
-# Create tables
-SQLModel.metadata.create_all(engine)
-
-# ---------------------------------------------------------------------
-# Auth helpers
-# ---------------------------------------------------------------------
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/admin/token", auto_error=False)
-
-def create_access_token(sub: str, username: str, expires_delta: Optional[timedelta] = None) -> str:
-    to_encode = {"sub": sub, "username": username}
-    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=JWT_EXPIRE_MINUTES))
-    to_encode.update({"exp": expire})
-    return jwt.encode(to_encode, JWT_SECRET, algorithm=JWT_ALGO)
-
-def decode_token(token: str):
-    try:
-        return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
-    except Exception:
-        return None
-
-async def get_current_admin(token: str = Depends(oauth2_scheme)):
-    if not token:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-    payload = decode_token(token)
-    if not payload:
-        raise HTTPException(status_code=401, detail="Invalid auth token")
-    username = payload.get("username")
-    if username != ADMIN_USERNAME:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    return {"username": username}
-
-# ---------------------------------------------------------------------
-# LAZY Embedder — loads only on first use
-# ---------------------------------------------------------------------
-_embedder = None
-
-def get_embedder():
-    global _embedder
-    if _embedder is None:
-        logger.info(f"Loading embedder: {EMBED_MODEL_NAME} ...")
-        from sentence_transformers import SentenceTransformer
-        _embedder = SentenceTransformer(EMBED_MODEL_NAME, device='cpu')
-        logger.info("✓ Embedder loaded")
-    return _embedder
-
-# ---------------------------------------------------------------------
-# LAZY ChromaDB — initializes only on first use
-# ---------------------------------------------------------------------
-_chroma_client = None
-_collection = None
-
-def get_collection():
-    global _chroma_client, _collection
-    if _collection is not None:
-        return _collection
-
-    os.makedirs(CHROMA_DIR, exist_ok=True)
-    try:
-        _chroma_client = chromadb.PersistentClient(
-            path=CHROMA_DIR,
-            settings=Settings(anonymized_telemetry=False, allow_reset=True)
-        )
-        _chroma_client.heartbeat()
-        try:
-            _collection = _chroma_client.get_collection("pdf_docs")
-            logger.info("✓ Using existing ChromaDB collection")
-        except Exception:
-            _collection = _chroma_client.create_collection(
-                name="pdf_docs",
-                metadata={"hnsw:space": "cosine"}
-            )
-            logger.info("✓ Created new ChromaDB collection")
-        logger.info(f"✓ ChromaDB initialized at {CHROMA_DIR}")
-    except Exception as e:
-        logger.error(f"PersistentClient failed: {e} — falling back to in-memory")
-        _chroma_client = chromadb.EphemeralClient()
-        _collection = _chroma_client.get_or_create_collection("pdf_docs")
-        logger.warning("⚠ Using in-memory ChromaDB (data will not persist)")
-
-    return _collection
-
-# ---------------------------------------------------------------------
-# Embed helper
-# ---------------------------------------------------------------------
-def embed_texts(texts: List[str]) -> List[List[float]]:
-    if not texts:
-        return []
-    try:
-        embedder = get_embedder()
-        embs = embedder.encode(texts, normalize_embeddings=True, show_progress_bar=False)
-        return embs.tolist() if isinstance(embs, np.ndarray) else embs
-    except Exception as e:
-        logger.error(f"Failed to embed texts: {e}")
-        raise
-
-# ---------------------------------------------------------------------
-# PDF processing helpers
-# ---------------------------------------------------------------------
-def read_pdf(file_bytes: bytes) -> str:
-    try:
-        reader = PdfReader(io.BytesIO(file_bytes))
-        text_parts = []
-        for page in reader.pages:
-            try:
-                text = page.extract_text()
-                if text and text.strip():
-                    text_parts.append(text.strip())
-            except Exception:
-                continue
-        return "\n".join(text_parts)
-    except Exception:
-        return ""
-
-def run_ocr_on_pdf(file_bytes: bytes) -> str:
-    if not OCR_AVAILABLE:
-        return ""
-    parts = []
-    try:
-        images = convert_from_bytes(file_bytes, fmt="jpeg", dpi=200)
-        for image in images:
-            try:
-                text = pytesseract.image_to_string(image)
-                if text and text.strip():
-                    parts.append(text.strip())
-            except Exception:
-                continue
-        return "\n".join(parts)
-    except Exception:
-        return ""
-
-def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 150) -> List[str]:
-    text = " ".join((text or "").split()).strip()
-    if not text:
-        return []
-    if overlap >= chunk_size:
-        overlap = max(0, chunk_size // 5)
-    step = max(1, chunk_size - overlap)
-    chunks = []
-    for start in range(0, len(text), step):
-        end = min(start + chunk_size, len(text))
-        chunk = text[start:end].strip()
-        if chunk:
-            chunks.append(chunk)
-        if end == len(text):
-            break
-    return chunks
-
-LANG_NAME = {
-    "en": "English", "te": "Telugu", "ta": "Tamil", "hi": "Hindi",
-    "mr": "Marathi", "kn": "Kannada", "ml": "Malayalam", "bn": "Bengali"
-}
-
-def build_prompt(question: str, contexts: List[str], lang_code: Optional[str]) -> str:
-    language_name = LANG_NAME.get((lang_code or "en").lower(), "English")
-    context_block = "\n\n".join([f"[Source {i+1}]\n{c}" for i, c in enumerate(contexts)])
-    return (
-        "You are a helpful assistant. Use only the provided context to answer. "
-        "If the answer isn't in the context, say you don't know. "
-        "Reply with ONLY the final answer text — no preface, no citations, no extra lines. "
-        f"Respond in {language_name}.\n\n"
-        f"Question: {question}\n\nContext:\n{context_block}"
-    )
-
-# ---------------------------------------------------------------------
-# Gemini helper - UPDATED FOR NEW API
-# ---------------------------------------------------------------------
-def gemini_generate(prompt: str, temperature: float = 0.2, max_tokens: int = 1024) -> Optional[str]:
-    try:
-        # Using the new google.genai client
-        response = genai_client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-            config={
-                "temperature": temperature,
-                "max_output_tokens": max_tokens,
-                "top_p": 0.95,
-                "top_k": 40,
-            }
-        )
-        
-        if response and response.text:
-            return response.text.strip()
-        else:
-            logger.warning("Gemini returned empty response")
-            return None
-    except Exception as e:
-        logger.error(f"Gemini generation failed: {e}")
-        return None
-
-# ---------------------------------------------------------------------
-# Schemas
-# ---------------------------------------------------------------------
+# Models
 class AskRequest(BaseModel):
     question: str
     top_k: int = 4
-    language: Optional[str] = None
+    language: Optional[str] = "en"
     dataset: Optional[str] = None
+    retrieval_model: Optional[str] = None
 
 class AskResponse(BaseModel):
     answer: str
@@ -340,352 +106,425 @@ class FeedbackRequest(BaseModel):
     feedback: str
     question: Optional[str] = None
     answer: Optional[str] = None
+    model_used: Optional[str] = None
     timestamp: Optional[str] = None
 
-# ---------------------------------------------------------------------
-# Routes
-# ---------------------------------------------------------------------
+class LoginRequest(BaseModel):
+    username: str
+    password: str
 
+# Create FastAPI app
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    logger.info("Starting MSME Chatbot API...")
+    yield
+    # Shutdown
+    logger.info("Shutting down...")
+    conn.close()
+
+app = FastAPI(title="MSME Chatbot API", version="1.0.0", lifespan=lifespan)
+
+# CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Helper functions
+def generate_response(question: str, context: str = "") -> str:
+    """Generate response using Gemini or fallback"""
+    if GEMINI_API_KEY and GEMINI_AVAILABLE:
+        try:
+            model = genai.GenerativeModel(GEMINI_MODEL)
+            prompt = f"""You are a helpful assistant for MSME (Micro, Small & Medium Enterprises) in India.
+            Answer the following question in a helpful, accurate manner.
+            Use the context if provided, otherwise use your knowledge about MSME schemes, registration, and policies.
+            
+            Context: {context if context else 'No specific context provided'}
+            
+            Question: {question}
+            
+            Answer:"""
+            
+            response = model.generate_content(prompt)
+            return response.text.strip()
+        except Exception as e:
+            logger.error(f"Gemini error: {e}")
+            return get_fallback_response(question)
+    else:
+        return get_fallback_response(question)
+
+def get_fallback_response(question: str) -> str:
+    """Fallback responses when Gemini is not available"""
+    q = question.lower()
+    if "register" in q or "udyam" in q:
+        return "MSME registration can be done through the Udyam Registration portal (https://udyamregistration.gov.in). The process is free, online, and based on self-declaration. You'll need your Aadhaar number and GSTIN (if applicable)."
+    elif "loan" in q or "finance" in q:
+        return "MSMEs can access various loan schemes including MUDRA loans (up to ₹10 lakhs), CGTMSE coverage (up to ₹2 crores without collateral), and the Emergency Credit Line Guarantee Scheme (ECLGS). Contact your bank's MSME branch for details."
+    elif "subsidy" in q or "scheme" in q or "benefit" in q:
+        return "Government offers several subsidies for MSMEs: Credit Linked Capital Subsidy Scheme (CLCSS) for technology upgradation (15% subsidy up to ₹15 lakhs), ISO certification reimbursement (up to ₹1 lakh), and GST composition scheme benefits."
+    elif "eligibility" in q:
+        return "MSME eligibility is based on investment in plant & machinery and annual turnover. Micro: <₹1 crore investment & <₹5 crore turnover. Small: <₹10 crore investment & <₹50 crore turnover. Medium: <₹50 crore investment & <₹250 crore turnover."
+    else:
+        return "Thank you for your question about MSMEs. For specific details, please visit the official MSME website or contact your local District Industries Centre (DIC). Is there anything specific about registration, loans, or government schemes you'd like to know?"
+
+def chunk_text(text: str, chunk_size: int = 500) -> List[str]:
+    """Split text into chunks"""
+    words = text.split()
+    chunks = []
+    current_chunk = []
+    current_size = 0
+    
+    for word in words:
+        current_size += len(word) + 1
+        if current_size > chunk_size and current_chunk:
+            chunks.append(' '.join(current_chunk))
+            current_chunk = [word]
+            current_size = len(word)
+        else:
+            current_chunk.append(word)
+    
+    if current_chunk:
+        chunks.append(' '.join(current_chunk))
+    
+    return chunks
+
+def extract_text_from_pdf(file_bytes: bytes) -> str:
+    """Extract text from PDF"""
+    try:
+        from pypdf import PdfReader
+        reader = PdfReader(io.BytesIO(file_bytes))
+        text = ""
+        for page in reader.pages:
+            page_text = page.extract_text()
+            if page_text:
+                text += page_text + "\n"
+        return text
+    except Exception as e:
+        logger.error(f"PDF extraction error: {e}")
+        return ""
+
+# API Endpoints
 @app.get("/")
 async def root():
     return {
-        "message": "PDF Q&A Chatbot API with Gemini",
-        "status": "healthy",
+        "status": "ok",
+        "message": "MSME Chatbot API is running",
         "version": "1.0.0",
-        "features": {
-            "ocr": OCR_AVAILABLE,
-            "tts": GTTS_AVAILABLE,
-            "model": GEMINI_MODEL,
-            "provider": "Google Gemini"
-        }
+        "endpoints": [
+            "/health",
+            "/ask",
+            "/datasets",
+            "/admin/login",
+            "/admin/upload",
+            "/admin/files"
+        ]
     }
 
 @app.get("/health")
 async def health():
-    chroma_status = "not_initialized"
-    db_status = "healthy"
-    gemini_status = "not_tested"
-
-    try:
-        with Session(engine) as session:
-            session.exec(select(LoggedQuestion).limit(1))
-        db_status = "healthy"
-    except Exception as e:
-        db_status = f"unhealthy: {str(e)}"
-
-    # Test Gemini connection
-    try:
-        test_response = genai_client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents="Test connection",
-            config={"max_output_tokens": 5}
-        )
-        gemini_status = "healthy" if test_response and test_response.text else "unhealthy"
-    except Exception as e:
-        gemini_status = f"unhealthy: {str(e)}"
-
-    # Only test chroma if already initialized
-    if _chroma_client is not None:
-        try:
-            _chroma_client.heartbeat()
-            chroma_status = "healthy"
-        except Exception as e:
-            chroma_status = f"unhealthy: {str(e)}"
-
     return {
-        "status": "ok",
-        "gemini_model": GEMINI_MODEL,
-        "gemini_status": gemini_status,
-        "chromadb": chroma_status,
-        "database": db_status,
-        "ocr": OCR_AVAILABLE,
-        "tts": GTTS_AVAILABLE,
-        "embedder_loaded": _embedder is not None
+        "status": "healthy",
+        "timestamp": datetime.utcnow().isoformat(),
+        "version": "1.0.0",
+        "features": {
+            "gemini": GEMINI_API_KEY is not None,
+            "embeddings": TRANSFORMERS_AVAILABLE
+        }
     }
 
 @app.get("/models")
-async def get_available_models():
+async def get_models():
     return {
         "models": [
             {
                 "id": "gemini",
-                "name": f"Google {GEMINI_MODEL}",
-                "provider": "Google Gemini",
-                "description": "Google's advanced AI model",
+                "name": "Google Gemini",
+                "provider": "Google",
+                "description": "Google's advanced AI model for document Q&A",
                 "icon": "🌟",
-                "available": True
+                "available": GEMINI_API_KEY is not None
             }
         ]
     }
 
-@app.post("/admin/login")
-async def admin_login(payload: dict = Body(...)):
-    username = payload.get("username")
-    password = payload.get("password")
-    if username != ADMIN_USERNAME or password != ADMIN_PASSWORD:
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-    token = create_access_token(sub=ADMIN_USERNAME, username=ADMIN_USERNAME)
-    return {"access_token": token, "token_type": "bearer"}
-
-@app.post("/admin/token")
-async def admin_token(form_data: OAuth2PasswordRequestForm = Depends()):
-    if form_data.username != ADMIN_USERNAME or form_data.password != ADMIN_PASSWORD:
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-    token = create_access_token(sub=ADMIN_USERNAME, username=ADMIN_USERNAME)
-    return {"access_token": token, "token_type": "bearer"}
-
-@app.get("/admin/logs")
-async def get_logged_questions(
-    limit: int = Query(200, gt=0, le=1000),
-    since: Optional[str] = Query(None),
-    admin=Depends(get_current_admin)
-):
-    with Session(engine) as session:
-        q = select(LoggedQuestion).order_by(LoggedQuestion.created_at.desc())
-        if since:
-            try:
-                since_dt = datetime.fromisoformat(since.replace('Z', '+00:00'))
-                q = q.where(LoggedQuestion.created_at >= since_dt)
-            except Exception as e:
-                logger.warning(f"Invalid 'since' param {since}: {e}")
-        rows = session.exec(q.limit(limit)).all()
-        return {"logs": [
-            {
-                "id": r.id,
-                "question": r.question,
-                "answer": r.answer,
-                "dataset": r.dataset,
-                "language": r.language,
-                "model_used": r.model_used,
-                "created_at": r.created_at.isoformat(),
-            }
-            for r in rows
-        ]}
-
 @app.get("/datasets")
 async def list_datasets():
-    try:
-        collection = get_collection()
-        results = collection.get(include=["metadatas"])
-        metadatas = results.get("metadatas", [])
-        datasets = set()
-        for meta in metadatas:
-            if isinstance(meta, dict) and "dataset" in meta:
-                if meta["dataset"] and meta["dataset"].strip():
-                    datasets.add(meta["dataset"].strip())
-        return {"datasets": sorted(list(datasets))}
-    except Exception as e:
-        logger.error(f"Failed to list datasets: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/ingest")
-async def ingest_pdfs(
-    files: List[UploadFile] = File(...),
-    dataset: Optional[str] = Form(None),
-    ocr: bool = Form(False)
-):
-    collection = get_collection()
-    texts = []
-    metadatas = []
-    ids = []
-    processed_files = []
-
-    for f in files:
-        if not f.filename.lower().endswith(".pdf"):
-            raise HTTPException(status_code=400, detail=f"Only PDF files supported: {f.filename}")
-
-        data = await f.read()
-        if len(data) > MAX_FILE_SIZE:
-            raise HTTPException(status_code=413, detail=f"File too large: {f.filename}")
-
-        content = read_pdf(data)
-        used_ocr = False
-
-        if not content.strip() and ocr:
-            try:
-                content = run_ocr_on_pdf(data)
-                used_ocr = True
-            except Exception as e:
-                logger.warning(f"OCR failed for {f.filename}: {e}")
-
-        if not content.strip():
-            logger.warning(f"⚠ No text found in {f.filename}")
-            continue
-
-        chunks = chunk_text(content)
-        if not chunks:
-            continue
-
-        if len(chunks) > MAX_CHUNKS:
-            chunks = chunks[:MAX_CHUNKS]
-
-        meta = {
-            "filename": f.filename,
-            "ocr": used_ocr,
-            "dataset": dataset or "default"
-        }
-
-        texts.extend(chunks)
-        metadatas.extend([meta] * len(chunks))
-        ids.extend([str(uuid.uuid4()) for _ in range(len(chunks))])
-        processed_files.append(f.filename)
-        logger.info(f"✓ Processed {f.filename}: {len(chunks)} chunks")
-
-    if not texts:
-        raise HTTPException(status_code=400, detail="No extractable text found in any PDF")
-
-    try:
-        vectors = embed_texts(texts)
-        collection.add(
-            documents=texts,
-            embeddings=vectors,
-            metadatas=metadatas,
-            ids=ids
-        )
-        return {
-            "success": True,
-            "documents_added": len(processed_files),
-            "chunks_indexed": len(texts),
-            "files": processed_files,
-            "dataset": dataset or "default"
-        }
-    except Exception as e:
-        logger.error(f"Failed to add to ChromaDB: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to index documents: {str(e)}")
+    """List available datasets"""
+    datasets = set()
+    for chunk in chunks_db:
+        if chunk.get("dataset"):
+            datasets.add(chunk["dataset"])
+    return {"datasets": list(datasets)}
 
 @app.post("/ask", response_model=AskResponse)
 async def ask_question(req: AskRequest):
-    question = (req.question or "").strip()
+    """Ask a question"""
+    question = req.question.strip()
     if not question:
         raise HTTPException(status_code=400, detail="Question cannot be empty")
-
-    with Session(engine) as session:
-        log_entry = LoggedQuestion(
-            question=question,
-            dataset=req.dataset,
-            language=req.language,
-            model_used=GEMINI_MODEL
-        )
-        session.add(log_entry)
-        session.commit()
-        log_id = log_entry.id
-
+    
+    # Log the question
+    cursor.execute(
+        "INSERT INTO logs (question, dataset, language, model_used) VALUES (?, ?, ?, ?)",
+        (question, req.dataset, req.language, "gemini")
+    )
+    conn.commit()
+    log_id = cursor.lastrowid
+    
+    # Search for relevant chunks
+    relevant_chunks = []
+    if req.dataset:
+        relevant_chunks = [c["text"] for c in chunks_db if c.get("dataset") == req.dataset]
+    else:
+        relevant_chunks = [c["text"] for c in chunks_db]
+    
+    # Get context from relevant chunks
+    context = "\n\n".join(relevant_chunks[:3]) if relevant_chunks else ""
+    
+    # Generate answer
     try:
-        collection = get_collection()
-        qvecs = embed_texts([question])
-        if not qvecs:
-            raise Exception("Empty embedding result")
-        qvec = qvecs[0]
-
-        if req.dataset:
-            results = collection.query(
-                query_embeddings=[qvec],
-                n_results=max(1, req.top_k),
-                where={"dataset": req.dataset}
-            )
-        else:
-            results = collection.query(
-                query_embeddings=[qvec],
-                n_results=max(1, req.top_k)
-            )
-
-        contexts = []
-        docs = results.get("documents", [[]])
-        if docs and len(docs) > 0:
-            contexts = docs[0] if isinstance(docs[0], list) else list(docs)
-
-        if not contexts:
-            answer = "I couldn't find relevant content in the indexed PDFs to answer your question."
-        else:
-            prompt = build_prompt(question, contexts, req.language)
-            answer = gemini_generate(prompt, temperature=0.2, max_tokens=1024)
-            if not answer:
-                answer = "I apologize, but I couldn't generate a proper answer. Please try again."
-
-        with Session(engine) as session:
-            log_entry = session.get(LoggedQuestion, log_id)
-            if log_entry:
-                log_entry.answer = answer
-                session.commit()
-
+        answer = generate_response(question, context)
+        
+        # Update log with answer
+        cursor.execute(
+            "UPDATE logs SET answer = ? WHERE id = ?",
+            (answer, log_id)
+        )
+        conn.commit()
+        
         return AskResponse(answer=answer)
-
     except Exception as e:
-        logger.error(f"Ask endpoint error: {e}")
-        with Session(engine) as session:
-            log_entry = session.get(LoggedQuestion, log_id)
-            if log_entry:
-                log_entry.answer = f"Error: {str(e)}"
-                session.commit()
+        logger.error(f"Ask error: {e}")
+        error_answer = f"Error generating response: {str(e)}"
+        cursor.execute(
+            "UPDATE logs SET answer = ? WHERE id = ?",
+            (error_answer, log_id)
+        )
+        conn.commit()
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/feedback")
 async def submit_feedback(feedback: FeedbackRequest):
+    """Submit feedback for an answer"""
     try:
-        with Session(engine) as session:
-            feedback_entry = FeedbackLog(
-                message_id=feedback.message_id,
-                feedback_type=feedback.feedback,
-                question=feedback.question,
-                answer=feedback.answer,
-                timestamp=feedback.timestamp or datetime.utcnow().isoformat()
-            )
-            session.add(feedback_entry)
-            session.commit()
+        cursor.execute(
+            """INSERT INTO feedback (message_id, feedback_type, question, answer, model_used, timestamp) 
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (feedback.message_id, feedback.feedback, feedback.question, 
+             feedback.answer, feedback.model_used, feedback.timestamp or datetime.utcnow().isoformat())
+        )
+        conn.commit()
         return {"status": "success", "message": "Feedback recorded"}
     except Exception as e:
-        logger.error(f"Failed to record feedback: {e}")
+        logger.error(f"Feedback error: {e}")
         raise HTTPException(status_code=500, detail="Failed to record feedback")
 
-@app.get("/admin/feedback-logs")
-async def get_feedback_logs(
-    feedback_type: Optional[str] = Query(None),
-    limit: int = Query(100, gt=0, le=1000),
-    offset: int = Query(0, ge=0),
-    admin=Depends(get_current_admin)
+@app.post("/admin/login")
+async def admin_login(req: LoginRequest):
+    """Admin login"""
+    if req.username != ADMIN_USERNAME or req.password != ADMIN_PASSWORD:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    
+    # Simple token (in production, use JWT)
+    import jwt
+    token = jwt.encode(
+        {"sub": req.username, "exp": datetime.utcnow() + timedelta(days=1)},
+        JWT_SECRET,
+        algorithm=JWT_ALGO
+    )
+    return {"access_token": token, "token_type": "bearer"}
+
+@app.post("/admin/upload")
+async def upload_pdfs(
+    files: List[UploadFile] = File(...),
+    dataset: Optional[str] = Form(None)
 ):
-    try:
-        with Session(engine) as session:
-            query = select(FeedbackLog)
-            if feedback_type:
-                query = query.where(FeedbackLog.feedback_type == feedback_type)
-            query = query.order_by(FeedbackLog.created_at.desc()).offset(offset).limit(limit)
-            logs = session.exec(query).all()
+    """Upload PDF files"""
+    if not files:
+        raise HTTPException(status_code=400, detail="No files provided")
+    
+    processed = []
+    for file in files:
+        if not file.filename.endswith('.pdf'):
+            continue
+        
+        content = await file.read()
+        text = extract_text_from_pdf(content)
+        
+        if text:
+            chunks = chunk_text(text)
+            for i, chunk in enumerate(chunks):
+                chunks_db.append({
+                    "id": str(uuid.uuid4()),
+                    "text": chunk,
+                    "filename": file.filename,
+                    "dataset": dataset or "default",
+                    "chunk_index": i
+                })
+            processed.append(file.filename)
+    
+    return {
+        "success": True,
+        "documents_added": len(processed),
+        "chunks_indexed": len([c for c in chunks_db if c.get("filename") in processed]),
+        "files": processed,
+        "dataset": dataset or "default"
+    }
 
-            total = len(session.exec(select(FeedbackLog)).all())
-            good = len(session.exec(select(FeedbackLog).where(FeedbackLog.feedback_type == "good")).all())
-            bad = len(session.exec(select(FeedbackLog).where(FeedbackLog.feedback_type == "bad")).all())
-            no_response = len(session.exec(select(FeedbackLog).where(FeedbackLog.feedback_type == "no_response")).all())
-
-            return {
-                "feedback_logs": [
-                    {
-                        "id": log.id,
-                        "message_id": log.message_id,
-                        "feedback_type": log.feedback_type,
-                        "question": log.question,
-                        "answer": log.answer,
-                        "timestamp": log.timestamp,
-                        "created_at": log.created_at.isoformat()
-                    }
-                    for log in logs
-                ],
-                "summary": {
-                    "total": total,
-                    "good": good,
-                    "bad": bad,
-                    "no_response": no_response
-                }
+@app.get("/admin/files")
+async def get_files():
+    """Get list of uploaded files"""
+    files_dict = {}
+    for chunk in chunks_db:
+        key = f"{chunk['filename']}_{chunk['dataset']}"
+        if key not in files_dict:
+            files_dict[key] = {
+                "filename": chunk["filename"],
+                "dataset": chunk["dataset"],
+                "chunk_count": 0,
+                "has_ocr": False
             }
-    except Exception as e:
-        logger.error(f"Failed to fetch feedback logs: {e}")
-        raise HTTPException(status_code=500, detail="Failed to fetch feedback logs")
+        files_dict[key]["chunk_count"] += 1
+    
+    return {"files": list(files_dict.values())}
 
-# ---------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------
+@app.delete("/admin/delete/file")
+async def delete_file(filename: str):
+    """Delete a file and its chunks"""
+    global chunks_db
+    original_count = len(chunks_db)
+    chunks_db = [c for c in chunks_db if c.get("filename") != filename]
+    removed = original_count - len(chunks_db)
+    
+    return {
+        "success": True,
+        "message": f"Deleted file {filename}",
+        "chunks_removed": removed
+    }
+
+@app.delete("/admin/delete/dataset")
+async def delete_dataset(dataset: str):
+    """Delete an entire dataset"""
+    global chunks_db
+    original_count = len(chunks_db)
+    chunks_db = [c for c in chunks_db if c.get("dataset") != dataset]
+    removed = original_count - len(chunks_db)
+    
+    return {
+        "success": True,
+        "message": f"Deleted dataset {dataset}",
+        "chunks_removed": removed
+    }
+
+@app.get("/admin/logs")
+async def get_logs(limit: int = 100):
+    """Get question logs"""
+    cursor.execute(
+        "SELECT id, question, answer, dataset, language, model_used, created_at FROM logs ORDER BY created_at DESC LIMIT ?",
+        (limit,)
+    )
+    rows = cursor.fetchall()
+    
+    return {"logs": [
+        {
+            "id": row[0],
+            "question": row[1],
+            "answer": row[2],
+            "dataset": row[3],
+            "language": row[4],
+            "model_used": row[5],
+            "created_at": row[6]
+        }
+        for row in rows
+    ]}
+
+@app.get("/admin/feedback-logs")
+async def get_feedback_logs(limit: int = 100, offset: int = 0, feedback_type: Optional[str] = None):
+    """Get feedback logs"""
+    query = "SELECT id, message_id, feedback_type, question, answer, model_used, timestamp, created_at FROM feedback"
+    params = []
+    
+    if feedback_type and feedback_type != "all":
+        query += " WHERE feedback_type = ?"
+        params.append(feedback_type)
+    
+    query += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
+    params.extend([limit, offset])
+    
+    cursor.execute(query, params)
+    rows = cursor.fetchall()
+    
+    # Get stats
+    cursor.execute("SELECT COUNT(*) FROM feedback")
+    total = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM feedback WHERE feedback_type = 'good'")
+    good = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM feedback WHERE feedback_type = 'bad'")
+    bad = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM feedback WHERE feedback_type = 'no_response'")
+    no_response = cursor.fetchone()[0]
+    
+    return {
+        "feedback_logs": [
+            {
+                "id": row[0],
+                "message_id": row[1],
+                "feedback_type": row[2],
+                "question": row[3],
+                "answer": row[4],
+                "model_used": row[5],
+                "timestamp": row[6],
+                "created_at": row[7]
+            }
+            for row in rows
+        ],
+        "summary": {
+            "total": total,
+            "good": good,
+            "bad": bad,
+            "no_response": no_response
+        }
+    }
+
+@app.post("/tts")
+async def text_to_speech(text: str, language: str = "en", speed: float = 1.0):
+    """Convert text to speech"""
+    try:
+        from gtts import gTTS
+        import tempfile
+        
+        tts = gTTS(text=text, lang=language[:2], slow=speed < 1.0)
+        
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
+            tts.save(tmp.name)
+            with open(tmp.name, "rb") as f:
+                audio_data = f.read()
+            os.unlink(tmp.name)
+            
+        from fastapi.responses import StreamingResponse
+        import io
+        return StreamingResponse(io.BytesIO(audio_data), media_type="audio/mpeg")
+    except Exception as e:
+        logger.error(f"TTS error: {e}")
+        raise HTTPException(status_code=500, detail="TTS failed")
+
+@app.post("/stt")
+async def speech_to_text(audio: UploadFile = File(...), lang: str = Form("en")):
+    """Convert speech to text"""
+    try:
+        # For now, return empty (implement with a proper STT service)
+        return {"text": ""}
+    except Exception as e:
+        logger.error(f"STT error: {e}")
+        return {"text": ""}
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
-    logger.info(f"Starting on port {port}...")
-    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
+    logger.info(f"Starting server on port {port}...")
+    uvicorn.run(app, host="0.0.0.0", port=port)

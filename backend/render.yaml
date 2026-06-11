@@ -1,15 +1,21 @@
 services:
   - type: web
-    name: msme-backend
+    name: msme-chatbot-backend
     runtime: python
+    repo: https://github.com/YOUR_USERNAME/YOUR_REPO
+    branch: main
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn app:app --host 0.0.0.0 --port ${PORT:-8000}
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: GEMINI_API_KEY
         sync: false
       - key: ADMIN_USERNAME
-        sync: false
+        value: admin
       - key: ADMIN_PASSWORD
         sync: false
       - key: JWT_SECRET
-        sync: false
+        generateValue: true
+      - key: GEMINI_MODEL
+        value: gemini-1.5-flash
+    plan: free
+    healthCheckPath: /health
